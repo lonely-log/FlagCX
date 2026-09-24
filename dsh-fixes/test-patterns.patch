@@ -1,0 +1,19 @@
+--- a/test/perf/host_api/test_self_sendrecv.cpp
++++ b/test/perf/host_api/test_self_sendrecv.cpp
+@@ -60,6 +60,16 @@
+     flagcxSend(b->s2, b->n2, flagcxChar, nextPeer, ctx.comm, ctx.stream);
+     flagcxRecv(b->r2, b->n2, flagcxChar, nextPeer, ctx.comm, ctx.stream);
+     flagcxRecv(b->r1, b->n1, flagcxChar, nextPeer, ctx.comm, ctx.stream);
++  } else if (gPattern == "self2same") {
++    flagcxSend(b->s1, b->n1, flagcxChar, selfPeer, ctx.comm, ctx.stream);
++    flagcxSend(b->s2, b->n1, flagcxChar, selfPeer, ctx.comm, ctx.stream);
++    flagcxRecv(b->r2, b->n1, flagcxChar, selfPeer, ctx.comm, ctx.stream);
++    flagcxRecv(b->r1, b->n1, flagcxChar, selfPeer, ctx.comm, ctx.stream);
++  } else if (gPattern == "remote2same") {
++    flagcxSend(b->s1, b->n1, flagcxChar, nextPeer, ctx.comm, ctx.stream);
++    flagcxSend(b->s2, b->n1, flagcxChar, nextPeer, ctx.comm, ctx.stream);
++    flagcxRecv(b->r2, b->n1, flagcxChar, nextPeer, ctx.comm, ctx.stream);
++    flagcxRecv(b->r1, b->n1, flagcxChar, nextPeer, ctx.comm, ctx.stream);
+   } else if (gPattern == "remote3") {
+     flagcxSend(b->s1, b->n1, flagcxChar, nextPeer, ctx.comm, ctx.stream);
+     flagcxSend(b->s2, b->n2, flagcxChar, nextPeer, ctx.comm, ctx.stream);

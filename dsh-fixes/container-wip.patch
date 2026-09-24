@@ -1,0 +1,105 @@
+diff --git a/Makefile b/Makefile
+index 48f3092..dc9ffdd 100755
+--- a/Makefile
++++ b/Makefile
+@@ -391,9 +391,10 @@ endif
+ $(OBJDIR)/%.o: %.$(DEVICE_FILE_EXTENSION)
+ 	@mkdir -p `dirname $@`
+ 	@echo "Compiling $@ ($(DEVICE_PLATFORM))"
+-	@$(DEVICE_COMPILER) $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) $(addprefix -I,$(DEVICE_INCLUDE)) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) $(DEVICE_COMPILE_FLAG) $(COMPILE_KERNEL_FLAG) -g
++	@$(DEVICE_COMPILER) $(DEVICE_COMPILE_FLAG) $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) $(addprefix -I,$(DEVICE_INCLUDE)) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) $(COMPILE_KERNEL_FLAG) -g
+ endif
+ 
++
+ ifeq ($(COMPILE_KERNEL), 1)
+ -include $(LIBOBJ:.o=.d) $(DEVOBJ:.o=.d)
+ else
+diff --git a/plugin/torch/example/run.sh b/plugin/torch/example/run.sh
+old mode 100644
+new mode 100755
+diff --git a/plugin/torch/flagcx/include/backend_flagcx.hpp b/plugin/torch/flagcx/include/backend_flagcx.hpp
+index ee9660c..a39832e 100644
+--- a/plugin/torch/flagcx/include/backend_flagcx.hpp
++++ b/plugin/torch/flagcx/include/backend_flagcx.hpp
+@@ -315,9 +315,21 @@ protected:
+   // participate in communicator initialization.
+   bool usePairComm_ = true;
+   std::unordered_map<std::string, flagcxComm_t> pairComms_;
++
++  enum class P2pDir { Send, Recv };
++
++  struct PendingP2pOp {
++    int peer;
++    P2pDir dir;
++    std::function<void()> run;
++
++    PendingP2pOp(int peer, P2pDir dir, std::function<void()> run)
++        : peer(peer), dir(dir), run(std::move(run)) {}
++  };
++
+   struct pairCoalesceCtx {
+     bool active = false;
+-    std::vector<std::pair<int, std::function<void()>>> pendingOps;
++    std::vector<PendingP2pOp> pendingOps;
+   };
+   pairCoalesceCtx pairCoalesce_;
+   flagcxComm_t getOrCreatePairComm(int peer);
+diff --git a/plugin/torch/flagcx/src/backend_flagcx.cpp b/plugin/torch/flagcx/src/backend_flagcx.cpp
+index 4f4e34d..ec0dcef 100644
+--- a/plugin/torch/flagcx/src/backend_flagcx.cpp
++++ b/plugin/torch/flagcx/src/backend_flagcx.cpp
+@@ -634,10 +634,22 @@ c10::intrusive_ptr<Work> flagcxBackend::endCoalescing() {
+     // Sort by peer ascending: canonical (min,max) order avoids deadlock.
+     std::stable_sort(
+         pairCoalesce_.pendingOps.begin(), pairCoalesce_.pendingOps.end(),
+-        [](const auto &a, const auto &b) { return a.first < b.first; });
+-    for (auto &kv : pairCoalesce_.pendingOps) {
+-      kv.second();
++        [this](const PendingP2pOp &a, const PendingP2pOp &b) {
++          if (a.peer != b.peer) {
++            return a.peer < b.peer;
++          }
++          const bool aIsSend = (a.dir == P2pDir::Send);
++          const bool bIsSend = (b.dir == P2pDir::Send);
++          if (aIsSend == bIsSend) {
++            return false;
++          }
++          const bool lowerRankSendsFirst = (rank_ < a.peer);
++          return lowerRankSendsFirst ? aIsSend : bIsSend;
++        });
++    for (auto &op : pairCoalesce_.pendingOps) {
++      op.run();
+     }
++
+     pairCoalesce_.pendingOps.clear();
+     pairCoalesce_.active = false;
+   } else {
+@@ -1495,7 +1507,7 @@ c10::intrusive_ptr<Work> flagcxBackend::send(std::vector<at::Tensor> &tensors,
+                         std::nullopt);
+     };
+     if (pairCoalesce_.active) {
+-      pairCoalesce_.pendingOps.emplace_back(dstRank, std::move(doSend));
++      pairCoalesce_.pendingOps.emplace_back(dstRank, P2pDir::Send, std::move(doSend));
+       return nullptr;
+     }
+     doSend();
+@@ -1549,7 +1561,7 @@ c10::intrusive_ptr<Work> flagcxBackend::recv(std::vector<at::Tensor> &tensors,
+                         std::nullopt);
+     };
+     if (pairCoalesce_.active) {
+-      pairCoalesce_.pendingOps.emplace_back(srcRank, std::move(doRecv));
++      pairCoalesce_.pendingOps.emplace_back(srcRank, P2pDir::Recv, std::move(doRecv));
+       return nullptr;
+     }
+     doRecv();
+diff --git a/test/perf/host_api/test_core_sendrecv.cpp b/test/perf/host_api/test_core_sendrecv.cpp
+index c12cc0b..8bfef22 100644
+--- a/test/perf/host_api/test_core_sendrecv.cpp
++++ b/test/perf/host_api/test_core_sendrecv.cpp
+@@ -216,4 +216,4 @@ int main(int argc, char *argv[]) {
+ 
+   MPI_Finalize();
+   return 0;
+-}
+\ No newline at end of file
++}
