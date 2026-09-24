@@ -315,9 +315,21 @@ protected:
   // participate in communicator initialization.
   bool usePairComm_ = true;
   std::unordered_map<std::string, flagcxComm_t> pairComms_;
+
+  enum class P2pDir { Send, Recv };
+
+  struct PendingP2pOp {
+    int peer;
+    P2pDir dir;
+    std::function<void()> run;
+
+    PendingP2pOp(int peer, P2pDir dir, std::function<void()> run)
+        : peer(peer), dir(dir), run(std::move(run)) {}
+  };
+
   struct pairCoalesceCtx {
     bool active = false;
-    std::vector<std::pair<int, std::function<void()>>> pendingOps;
+    std::vector<PendingP2pOp> pendingOps;
   };
   pairCoalesceCtx pairCoalesce_;
   flagcxComm_t getOrCreatePairComm(int peer);

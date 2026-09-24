@@ -634,10 +634,22 @@ c10::intrusive_ptr<Work> flagcxBackend::endCoalescing() {
     // Sort by peer ascending: canonical (min,max) order avoids deadlock.
     std::stable_sort(
         pairCoalesce_.pendingOps.begin(), pairCoalesce_.pendingOps.end(),
-        [](const auto &a, const auto &b) { return a.first < b.first; });
-    for (auto &kv : pairCoalesce_.pendingOps) {
-      kv.second();
+        [this](const PendingP2pOp &a, const PendingP2pOp &b) {
+          if (a.peer != b.peer) {
+            return a.peer < b.peer;
+          }
+          const bool aIsSend = (a.dir == P2pDir::Send);
+          const bool bIsSend = (b.dir == P2pDir::Send);
+          if (aIsSend == bIsSend) {
+            return false;
+          }
+          const bool lowerRankSendsFirst = (rank_ < a.peer);
+          return lowerRankSendsFirst ? aIsSend : bIsSend;
+        });
+    for (auto &op : pairCoalesce_.pendingOps) {
+      op.run();
     }
+
     pairCoalesce_.pendingOps.clear();
     pairCoalesce_.active = false;
   } else {
@@ -1495,7 +1507,7 @@ c10::intrusive_ptr<Work> flagcxBackend::send(std::vector<at::Tensor> &tensors,
                         std::nullopt);
     };
     if (pairCoalesce_.active) {
-      pairCoalesce_.pendingOps.emplace_back(dstRank, std::move(doSend));
+      pairCoalesce_.pendingOps.emplace_back(dstRank, P2pDir::Send, std::move(doSend));
       return nullptr;
     }
     doSend();
@@ -1549,7 +1561,7 @@ c10::intrusive_ptr<Work> flagcxBackend::recv(std::vector<at::Tensor> &tensors,
                         std::nullopt);
     };
     if (pairCoalesce_.active) {
-      pairCoalesce_.pendingOps.emplace_back(srcRank, std::move(doRecv));
+      pairCoalesce_.pendingOps.emplace_back(srcRank, P2pDir::Recv, std::move(doRecv));
       return nullptr;
     }
     doRecv();
