@@ -321,11 +321,22 @@ static flagcxResult_t progressOps(struct flagcxProxyState *proxyState,
           if (!flagcxIntruQueueEmpty(queue)) {
             *idle &= 0;
             struct flagcxProxyOp *op = flagcxIntruQueueHead(queue);
+            // Walk the entire queue rather than only the head: if only the
+            // head advances, two ranks whose op orders differ (different
+            // sizes sent/received in a different order) block each other's
+            // head op and deadlock.
+            while (op != NULL) {
+              struct flagcxProxyOp *nextOp = op->next;
             if (op->connection->transport == TRANSPORT_NET) {
               struct sendNetResources *resources =
                   (sendNetResources *)op->connection->transportResources;
               flagcxProxySend(resources, op->recvbuff, op->nbytes, &op->args);
-              if (op->args.done == 1 && op->args.semaphore->pollEnd()) {
+              // Retire as soon as this op is done. Gating on the group-wide
+              // pollEnd() deadlocks any queue holding >1 op: the head cannot
+              // retire until every op in the group completes, while the other
+              // ops cannot start until the head retires. The semaphore is a
+              // per-op shared_ptr, so it is released by the last op.
+              if (op->args.done == 1) {
                 op->args.semaphore.reset();
                 flagcxIntruQueueDelete(queue, op);
                 free(op);
@@ -340,22 +351,40 @@ static flagcxResult_t progressOps(struct flagcxProxyState *proxyState,
                 flagcxP2pProxySelfCopy(resources, op->sendbuff, op->recvbuff,
                                        op->nbytes, &op->args);
               }
-              if (op->args.done == 1 && op->args.semaphore->pollEnd()) {
+              // Retire as soon as this op is done. Gating on the group-wide
+              // pollEnd() deadlocks any queue holding >1 op: the head cannot
+              // retire until every op in the group completes, while the other
+              // ops cannot start until the head retires. The semaphore is a
+              // per-op shared_ptr, so it is released by the last op.
+              if (op->args.done == 1) {
                 op->args.semaphore.reset();
                 flagcxIntruQueueDelete(queue, op);
                 free(op);
               }
+            }
+              op = nextOp;
             }
           }
           queue = &peer->recvQueue;
           if (!flagcxIntruQueueEmpty(queue)) {
             *idle &= 0;
             struct flagcxProxyOp *op = flagcxIntruQueueHead(queue);
+            // Walk the entire queue rather than only the head: if only the
+            // head advances, two ranks whose op orders differ (different
+            // sizes sent/received in a different order) block each other's
+            // head op and deadlock.
+            while (op != NULL) {
+              struct flagcxProxyOp *nextOp = op->next;
             if (op->connection->transport == TRANSPORT_NET) {
               struct recvNetResources *resources =
                   (recvNetResources *)op->connection->transportResources;
               flagcxProxyRecv(resources, op->recvbuff, op->nbytes, &op->args);
-              if (op->args.done == 1 && op->args.semaphore->pollEnd()) {
+              // Retire as soon as this op is done. Gating on the group-wide
+              // pollEnd() deadlocks any queue holding >1 op: the head cannot
+              // retire until every op in the group completes, while the other
+              // ops cannot start until the head retires. The semaphore is a
+              // per-op shared_ptr, so it is released by the last op.
+              if (op->args.done == 1) {
                 // update refcount and delete semaphore when refcount = 0
                 op->args.semaphore.reset();
                 flagcxIntruQueueDelete(queue, op);
@@ -366,12 +395,19 @@ static flagcxResult_t progressOps(struct flagcxProxyState *proxyState,
                   (flagcxP2pResources *)op->connection->transportResources;
               flagcxP2pProxyRecv(resources, op->recvbuff, op->nbytes,
                                  &op->args);
-              if (op->args.done == 1 && op->args.semaphore->pollEnd()) {
+              // Retire as soon as this op is done. Gating on the group-wide
+              // pollEnd() deadlocks any queue holding >1 op: the head cannot
+              // retire until every op in the group completes, while the other
+              // ops cannot start until the head retires. The semaphore is a
+              // per-op shared_ptr, so it is released by the last op.
+              if (op->args.done == 1) {
                 // update refcount and delete semaphore when refcount = 0
                 op->args.semaphore.reset();
                 flagcxIntruQueueDelete(queue, op);
                 free(op);
               }
+            }
+              op = nextOp;
             }
           }
           if (flagcxIntruQueueEmpty(&peer->sendQueue) &&
