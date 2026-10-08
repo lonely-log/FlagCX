@@ -191,6 +191,16 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
       int nRanks = comm->nRanks;
       int localRanks = comm->localRanks;
 
+      // Step ordering must agree between the two ranks that match an op pair.
+      // A single per-direction counter does not: it follows the local op order
+      // while ops are matched by (bytes, dtype). Two ranks posting different
+      // sizes in a different order then give matching ops different steps, and
+      // the pollStart(opId, step) pipeline deadlocks. Key the step by
+      // (bytes, dtype) per direction, which both ranks derive identically; for
+      // repeated ops of one size this keeps the original round pipeline.
+      std::map<std::pair<size_t, flagcxDataType_t>, int> sendStepByKey;
+      std::map<std::pair<size_t, flagcxDataType_t>, int> recvStepByKey;
+
       // Round 0: handle self send/recv (local copy)
       {
         int peer = comm->rank;
@@ -313,7 +323,9 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                     : p2p->opId;
             op->args.step =
                 p2p->step == -1
-                    ? (p2pScheduleDisable ? defaultStep : roundRecvStep)
+                    ? (p2pScheduleDisable
+                           ? defaultStep
+                           : recvStepByKey[{p2p->bytes, p2p->dtype}]++)
                     : p2p->step;
             op->event = semaphore->getEvent();
             semaphore->addCounter(op->args.opId);
@@ -365,7 +377,9 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
                                 : p2p->opId;
             op->args.step =
                 p2p->step == -1
-                    ? (p2pScheduleDisable ? defaultStep : roundSendStep)
+                    ? (p2pScheduleDisable
+                           ? defaultStep
+                           : sendStepByKey[{p2p->bytes, p2p->dtype}]++)
                     : p2p->step;
             op->event = semaphore->getEvent();
             semaphore->addCounter(op->args.opId);
@@ -407,8 +421,12 @@ static flagcxResult_t groupLaunch(struct flagcxAsyncJob *job_) {
       // device semaphore need this event to signal completion
       FLAGCXCHECK(deviceAdaptor->eventRecord(launchEvent, launchStream));
     } else {
+      // The proxy ops release their semaphore reference as soon as each op
+      // completes, so the callback must own a reference to keep the semaphore
+      // (and its events) alive until wait() returns.
+      auto *semHolder = new std::shared_ptr<flagcxSemaphore>(semaphore);
       FLAGCXCHECK(deviceAdaptor->launchHostFunc(launchStream, cpuAsyncKernel,
-                                                (void *)semaphore.get()));
+                                                (void *)semHolder));
     }
   }
 

@@ -1,5 +1,6 @@
 #include "launch_kernel.h"
 #include "group.h"
+#include <memory>
 #include <stdio.h>
 
 flagcxLaunchFunc_t deviceAsyncKernel = NULL;
@@ -72,7 +73,10 @@ void *flagcxDeviceSemaphoreBufferPool::getDevicePtr(int id) {
 }
 
 void cpuAsyncKernel(void *args) {
-  flagcxHostSemaphore *semaphore = (flagcxHostSemaphore *)args;
+  // Owns the reference handed over by groupLaunch for the duration of wait().
+  std::unique_ptr<std::shared_ptr<flagcxSemaphore>> semHolder(
+      static_cast<std::shared_ptr<flagcxSemaphore> *>(args));
+  flagcxSemaphore *semaphore = semHolder->get();
   semaphore->signalStart();
   semaphore->wait();
 }

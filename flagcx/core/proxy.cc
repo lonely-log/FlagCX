@@ -524,61 +524,75 @@ static flagcxResult_t progressOps(struct flagcxProxyState *proxyState,
           if (!flagcxIntruQueueEmpty(queue)) {
             *idle &= 0;
             struct flagcxProxyOp *op = flagcxIntruQueueHead(queue);
-            flagcxResult_t asyncResult =
+            // Walk the entire queue, not just the head: with only the head
+            // advanced, two ranks whose op orders differ block each other's
+            // head op and deadlock (p2p group send/recv hang).
+            while (op != NULL) {
+              struct flagcxProxyOp *nextOp = op->next;
+              flagcxResult_t asyncResult =
                 __atomic_load_n(&proxyState->asyncResult, __ATOMIC_ACQUIRE);
-            if (asyncResult != flagcxSuccess &&
+              if (asyncResult != flagcxSuccess &&
                 asyncResult != flagcxInProgress) {
-              flagcxProxyRetireFailedQueue(queue);
-              op = NULL;
-            }
-            if (op != NULL) {
+                flagcxProxyRetireFailedQueue(queue);
+                break;
+              }
               flagcxResult_t res =
-                  op->connection->tcomm == NULL ||
-                          op->connection->tcomm->progressProxyOp == NULL
-                      ? flagcxNotSupported
-                      : op->connection->tcomm->progressProxyOp(op->connection,
-                                                               op);
+                op->connection->tcomm == NULL ||
+                  op->connection->tcomm->progressProxyOp == NULL
+                ? flagcxNotSupported
+                : op->connection->tcomm->progressProxyOp(op->connection, op);
               if (res != flagcxSuccess && res != flagcxInProgress) {
                 flagcxProxyFailProgressQueue(proxyState, queue, res);
-                op = NULL;
+                break;
               }
-              if (op != NULL && op->args.done == 1 &&
-                  op->args.semaphore->pollEnd()) {
+              // Retire as soon as THIS op is done. The group-wide completion
+              // gate below deadlocks any queue holding more than one op: the
+              // head cannot retire until every op in the group has completed,
+              // while the other ops cannot start until the head retires.
+              if (op->args.done == 1) {
                 op->args.semaphore.reset();
                 flagcxIntruQueueDelete(queue, op);
                 free(op);
               }
+              op = nextOp;
             }
           }
           queue = &peer->recvQueue;
           if (!flagcxIntruQueueEmpty(queue)) {
             *idle &= 0;
             struct flagcxProxyOp *op = flagcxIntruQueueHead(queue);
-            flagcxResult_t asyncResult =
+            // Walk the entire queue, not just the head: with only the head
+            // advanced, two ranks whose op orders differ block each other's
+            // head op and deadlock (p2p group send/recv hang).
+            while (op != NULL) {
+              struct flagcxProxyOp *nextOp = op->next;
+              flagcxResult_t asyncResult =
                 __atomic_load_n(&proxyState->asyncResult, __ATOMIC_ACQUIRE);
-            if (asyncResult != flagcxSuccess &&
+              if (asyncResult != flagcxSuccess &&
                 asyncResult != flagcxInProgress) {
-              flagcxProxyRetireFailedQueue(queue);
-              op = NULL;
-            }
-            if (op != NULL) {
+                flagcxProxyRetireFailedQueue(queue);
+                break;
+              }
               flagcxResult_t res =
-                  op->connection->tcomm == NULL ||
-                          op->connection->tcomm->progressProxyOp == NULL
-                      ? flagcxNotSupported
-                      : op->connection->tcomm->progressProxyOp(op->connection,
-                                                               op);
+                op->connection->tcomm == NULL ||
+                  op->connection->tcomm->progressProxyOp == NULL
+                ? flagcxNotSupported
+                : op->connection->tcomm->progressProxyOp(op->connection, op);
               if (res != flagcxSuccess && res != flagcxInProgress) {
                 flagcxProxyFailProgressQueue(proxyState, queue, res);
-                op = NULL;
+                break;
               }
-              if (op != NULL && op->args.done == 1 &&
-                  op->args.semaphore->pollEnd()) {
+              // Retire as soon as THIS op is done. The group-wide completion
+              // gate below deadlocks any queue holding more than one op: the
+              // head cannot retire until every op in the group has completed,
+              // while the other ops cannot start until the head retires.
+              if (op->args.done == 1) {
                 // update refcount and delete semaphore when refcount = 0
                 op->args.semaphore.reset();
                 flagcxIntruQueueDelete(queue, op);
                 free(op);
               }
+              op = nextOp;
             }
           }
           if (flagcxIntruQueueEmpty(&peer->sendQueue) &&
