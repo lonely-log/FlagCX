@@ -83,6 +83,17 @@ static inline uint64_t makeKey(uint32_t rank, uint32_t peerRank, uint64_t size,
   return key;
 }
 
+static inline uint64_t mixKey(uint64_t k) {
+  // Every field of `key` is shifted by >= reservedBits(4), so key % 16 == 0.
+  // Mix so the key's entropy (size/dtype/peerDelta) reaches the low bits.
+  k ^= k >> 33;
+  k *= 0xff51afd7ed558ccdULL;
+  k ^= k >> 33;
+  k *= 0xc4ceb9fe1a85ec53ULL;
+  k ^= k >> 33;
+  return k;
+}
+
 void setP2pSlotInfo(int rank, int peerRank, size_t size, flagcxDataType_t dtype,
                     int isRecv, uint64_t *opHash, size_t *slotIdx) {
   uint64_t key = makeKey(rank, peerRank, size, dtype);
@@ -104,8 +115,13 @@ void setP2pSlotInfo(int rank, int peerRank, size_t size, flagcxDataType_t dtype,
   }
   // Ensure that opHash is unique for each operation
   *opHash = key + opHashCounter;
-  // First half slots for send, second half for recv
-  *slotIdx = (*opHash) % (FLAGCX_P2P_MAX_OPS / 2);
+  // First half slots for send, second half for recv.
+  // Using opHash directly collapses to the per-key counter (key % 16 == 0 and
+  // the counter restarts at 1 for every new key), so concurrent ops of
+  // different sizes all landed on slot 1 (send) / 17 (recv) and deadlocked the
+  // peer handshake. Mix the key so distinct ops get distinct slots.
+  *slotIdx = (mixKey(key) + (uint64_t)opHashCounter) %
+             (FLAGCX_P2P_MAX_OPS / 2);
   if (isRecv) {
     *slotIdx += (FLAGCX_P2P_MAX_OPS / 2);
   }
