@@ -12,7 +12,7 @@
 | 问题 | group 内对**同一 peer、同一方向**提交 ≥2 个 op 时挂死（`flagcxSend`/`flagcxRecv`） |
 | 上游是否已修 | **没有**。`3dcea55 → 250ee84` 的 18 个新 commit 中有 8 个碰过相关文件，但缺陷点逐一仍在，且**没有任何 commit message 提及 deadlock/hang** |
 | 最小充分修复 | **3 处**：`proxy.cc`（遍历整队列）、`p2p.cc`（槽位散列）、`group.cc`（step 按 size/dtype 分键） |
-| 分支 | `fix/p2p-minimal`（基于 `250ee84`，4 个 commit） |
+| 分支 | `fix/p2p-hang-matrix`（基于 `250ee84`，4 个 commit） |
 | 验证 | 7/7 p2p pattern 通过；`perf_core_sendrecv`（128K→4G）通过；完整 perf sweep **PASS=13 FAIL=2 与基线逐项一致**、4G 吞吐无差异 |
 | 环境 | 单节点 Iluvatar Corex 5.1.0（MR-V50 ×2 + MR-V100 ×1），`np=2` |
 
@@ -146,7 +146,7 @@ r0.Send(100)[s0] → r1.Recv(100)[s1] → r1.Recv(200)[s0] → r0.Send(200)[s1] 
 
 ---
 
-## 5. 验证（`fix/p2p-minimal`，③④⑤）
+## 5. 验证（`fix/p2p-hang-matrix`，③④⑤）
 
 **A) p2p pattern 矩阵 —— 7/7**
 
@@ -201,7 +201,7 @@ ring ✅  self1 ✅  self2 ✅  remote2 ✅  remote2same ✅  self2same ✅  mix
 ## 8. 分支 / 补丁 / 回滚
 
 ```
-fix/p2p-minimal（基于 250ee84）
+fix/p2p-hang-matrix（基于 250ee84）
 5670481 fix(proxy): advance the whole p2p queue instead of only the head
 1586eb5 fix(p2p): mix the op key before deriving the sync slot index
 fb08e8b fix(group): key the p2p step by bytes/dtype so both ranks agree
