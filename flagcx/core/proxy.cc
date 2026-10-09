@@ -524,61 +524,65 @@ static flagcxResult_t progressOps(struct flagcxProxyState *proxyState,
           if (!flagcxIntruQueueEmpty(queue)) {
             *idle &= 0;
             struct flagcxProxyOp *op = flagcxIntruQueueHead(queue);
-            flagcxResult_t asyncResult =
+            // Walk the entire queue rather than only the head.
+            while (op != NULL) {
+              struct flagcxProxyOp *nextOp = op->next;
+              flagcxResult_t asyncResult =
                 __atomic_load_n(&proxyState->asyncResult, __ATOMIC_ACQUIRE);
-            if (asyncResult != flagcxSuccess &&
+              if (asyncResult != flagcxSuccess &&
                 asyncResult != flagcxInProgress) {
-              flagcxProxyRetireFailedQueue(queue);
-              op = NULL;
-            }
-            if (op != NULL) {
+                flagcxProxyRetireFailedQueue(queue);
+                break;
+              }
               flagcxResult_t res =
-                  op->connection->tcomm == NULL ||
-                          op->connection->tcomm->progressProxyOp == NULL
-                      ? flagcxNotSupported
-                      : op->connection->tcomm->progressProxyOp(op->connection,
-                                                               op);
+                op->connection->tcomm == NULL ||
+                  op->connection->tcomm->progressProxyOp == NULL
+                ? flagcxNotSupported
+                : op->connection->tcomm->progressProxyOp(op->connection, op);
               if (res != flagcxSuccess && res != flagcxInProgress) {
                 flagcxProxyFailProgressQueue(proxyState, queue, res);
-                op = NULL;
+                break;
               }
-              if (op != NULL && op->args.done == 1 &&
-                  op->args.semaphore->pollEnd()) {
+              // NOTE: the group-wide pollEnd() gate is deliberately KEPT here.
+              if (op->args.done == 1 && op->args.semaphore->pollEnd()) {
                 op->args.semaphore.reset();
                 flagcxIntruQueueDelete(queue, op);
                 free(op);
               }
+              op = nextOp;
             }
           }
           queue = &peer->recvQueue;
           if (!flagcxIntruQueueEmpty(queue)) {
             *idle &= 0;
             struct flagcxProxyOp *op = flagcxIntruQueueHead(queue);
-            flagcxResult_t asyncResult =
+            // Walk the entire queue rather than only the head.
+            while (op != NULL) {
+              struct flagcxProxyOp *nextOp = op->next;
+              flagcxResult_t asyncResult =
                 __atomic_load_n(&proxyState->asyncResult, __ATOMIC_ACQUIRE);
-            if (asyncResult != flagcxSuccess &&
+              if (asyncResult != flagcxSuccess &&
                 asyncResult != flagcxInProgress) {
-              flagcxProxyRetireFailedQueue(queue);
-              op = NULL;
-            }
-            if (op != NULL) {
+                flagcxProxyRetireFailedQueue(queue);
+                break;
+              }
               flagcxResult_t res =
-                  op->connection->tcomm == NULL ||
-                          op->connection->tcomm->progressProxyOp == NULL
-                      ? flagcxNotSupported
-                      : op->connection->tcomm->progressProxyOp(op->connection,
-                                                               op);
+                op->connection->tcomm == NULL ||
+                  op->connection->tcomm->progressProxyOp == NULL
+                ? flagcxNotSupported
+                : op->connection->tcomm->progressProxyOp(op->connection, op);
               if (res != flagcxSuccess && res != flagcxInProgress) {
                 flagcxProxyFailProgressQueue(proxyState, queue, res);
-                op = NULL;
+                break;
               }
-              if (op != NULL && op->args.done == 1 &&
-                  op->args.semaphore->pollEnd()) {
+              // NOTE: the group-wide pollEnd() gate is deliberately KEPT here.
+              if (op->args.done == 1 && op->args.semaphore->pollEnd()) {
                 // update refcount and delete semaphore when refcount = 0
                 op->args.semaphore.reset();
                 flagcxIntruQueueDelete(queue, op);
                 free(op);
               }
+              op = nextOp;
             }
           }
           if (flagcxIntruQueueEmpty(&peer->sendQueue) &&
