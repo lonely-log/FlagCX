@@ -154,32 +154,37 @@ struct PlatformTraits<IluvatarPlatform> {
     // fences before the volatile store, and RMW is deliberately restricted
     // to uint32_t. DefaultBackend selects this width at compile time; no
     // unsupported 64-bit RMW is emitted for ivcore11.
+    //
+    // The relaxed/release path used to call __atomic_load_n. ivcore11 has no
+    // pattern for AtomicLoad in address space 1, so that crashed llc with
+    // "Cannot select: AtomicLoad ... addrspace 1" for BOTH i32 and i64; every
+    // polling loop in a real kernel died with it. Every load is therefore a
+    // volatile load, matching what store() already does on its non-relaxed
+    // path, and the release edge keeps its fence. Requested orderings here are
+    // all ACQUIRE-or-weaker; a nested RELEASE is not something the RMW accesses
+    // rely on, so no extra fence is needed to stay at least as strong as
+    // relaxed.
     template <typename T, flagcxDeviceScope_t Scope = flagcxDeviceScopeSystem>
     FLAGCX_DEVICE_INLINE_DECORATOR static T
     load(T *ptr, flagcxDeviceMemoryOrder_t order) {
       (void)Scope;
-      switch (order) {
-        case flagcxDeviceMemoryOrderRelaxed:
-        case flagcxDeviceMemoryOrderRelease:
-          return __atomic_load_n(ptr, __ATOMIC_RELAXED);
-        case flagcxDeviceMemoryOrderAcquire:
-        case flagcxDeviceMemoryOrderAcqRel:
-        case flagcxDeviceMemoryOrderSeqCst:
-        default:
-          return *const_cast<volatile T *>(ptr);
-      }
+      (void)order;
+      return *FLAGCX_IR_GLOBAL_VOLATILE_CAST(T, ptr);
     }
 
     template <typename T, flagcxDeviceScope_t Scope = flagcxDeviceScopeSystem>
     FLAGCX_DEVICE_INLINE_DECORATOR static void
     store(T *ptr, const T &value, flagcxDeviceMemoryOrder_t order) {
       (void)Scope;
-      if (order == flagcxDeviceMemoryOrderRelaxed) {
-        __atomic_store_n(ptr, value, __ATOMIC_RELAXED);
-        return;
+      // Release publication is the fence plus the volatile store on every
+      // path. The relaxed path used to reach for __atomic_store_n, which
+      // lowers to the same unselectable AtomicStore in address space 1 that
+      // the load side hit; a volatile store is ordered enough for a value that
+      // readers only poll, and the non-relaxed path already used one.
+      if (order != flagcxDeviceMemoryOrderRelaxed) {
+        FLAGCX_DEVICE_THREAD_FENCE();
       }
-      FLAGCX_DEVICE_THREAD_FENCE();
-      *const_cast<volatile T *>(ptr) = value;
+      *FLAGCX_IR_GLOBAL_VOLATILE_CAST(T, ptr) = value;
     }
 
     template <typename T, flagcxDeviceScope_t Scope = flagcxDeviceScopeSystem>
