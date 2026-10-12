@@ -79,8 +79,16 @@ struct PlatformTraits<IluvatarPlatform> {
       __builtin_trap();
     }
 
-    FLAGCX_DEVICE_INLINE_DECORATOR static void spinBackoff(int) {
-      asm volatile("");
+    FLAGCX_DEVICE_INLINE_DECORATOR static void spinBackoff(int iter) {
+      // Same exponential ladder the reference implementations use (1, 2, 4 ...
+      // capped at 2^15), so the poll loops back off on contention instead of
+      // hammering the flag. __nanosleep is not verified on ivcore11, so the
+      // clock64() form is used unconditionally; the old body was an empty asm,
+      // i.e. no backoff at all.
+      const int delay = 1 << (iter < 15 ? iter : 15);
+      const long long start = clock64();
+      while (clock64() - start < (long long)delay) {
+      }
     }
 
     FLAGCX_DEVICE_INLINE_DECORATOR static void threadfenceSystem() {
@@ -168,8 +176,26 @@ struct PlatformTraits<IluvatarPlatform> {
     FLAGCX_DEVICE_INLINE_DECORATOR static T
     load(T *ptr, flagcxDeviceMemoryOrder_t order) {
       (void)Scope;
-      (void)order;
-      return *FLAGCX_IR_GLOBAL_VOLATILE_CAST(T, ptr);
+      const T value = *FLAGCX_IR_GLOBAL_VOLATILE_CAST(T, ptr);
+      // §5.2 requires acquire/release visibility, and the release edge has
+      // always fenced. A volatile load only stops the compiler from caching the
+      // read; it says nothing about the accesses that follow, and every barrier
+      // and signal poll - the loops that decide whether a remote write has
+      // become visible - is exactly where that matters. The fence therefore
+      // sits AFTER the load (the release fence sits before the store), so later
+      // accesses cannot be hoisted above the observed value. Relaxed and
+      // release loads stay plain volatile: a release edge on a load is not a
+      // thing, which is why the previous switch grouped Release with Relaxed.
+      switch (order) {
+        case flagcxDeviceMemoryOrderAcquire:
+        case flagcxDeviceMemoryOrderAcqRel:
+        case flagcxDeviceMemoryOrderSeqCst:
+          FLAGCX_DEVICE_THREAD_FENCE();
+          break;
+        default:
+          break;
+      }
+      return value;
     }
 
     template <typename T, flagcxDeviceScope_t Scope = flagcxDeviceScopeSystem>

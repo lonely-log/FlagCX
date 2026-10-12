@@ -89,3 +89,67 @@ flagcxResult_t flagcxTestLaunchUnsupportedCoop(flagcxStream_t stream) {
   cudaError_t err = cudaGetLastError();
   return (err == cudaSuccess) ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
+
+// ---------------------------------------------------------------------------
+// S3 wave/mask micro-benchmark.
+//
+// The partial-mask policy cannot be set from the headers: nothing states how
+// wide __activemask() really is, and nothing states whether the no-argument
+// __syncwarp() waits for the whole wave or only for the lanes that arrive. The
+// plan asks for a probe with a watchdog; measuring waiting time answers the
+// same question without ever being able to wedge a shared device, because every
+// lane reaches the barrier and the upper half merely arrives late.
+//
+//   results[0] low word of __activemask()
+//   results[1] popcount of __activemask()      (expect the wave width, 64)
+//   results[2] high word of __activemask()     (expect -1, i.e. lanes 32-63 set)
+//   results[3] cycles lane 0 spent in the barrier (the early half)
+//   results[4] cycles lane 32 spent altogether   (the late half)
+//   results[5] 0x1234 written by lane 63 after the barrier
+// ---------------------------------------------------------------------------
+#define FLAGCX_ILUVATAR_PROBE_SLOW_CYCLES 2000000
+
+__global__ void flagcxIluvatarSyncwarpProbeKernel(int *results) {
+  const int t = FLAGCX_THREAD_IDX_X;
+  const unsigned long long mask = (unsigned long long)__activemask();
+  if (t == 0) {
+    results[0] = (int)(mask & 0xffffffffull);
+    results[1] = (int)__popcll(mask);
+    results[2] = (int)(mask >> 32);
+  }
+
+  const long long start = clock64();
+  if (t >= 32) {
+    const long long spinStart = clock64();
+    // Hard iteration cap on top of the clock deadline: if the device clock ever
+    // stops advancing, an uncapped deadline-spin never returns and wedges the
+    // GPU for every other user until the process is force-killed.
+    int guard = 0;
+    while (++guard < 20000000 && clock64() - spinStart <
+                                     (long long)
+                                         FLAGCX_ILUVATAR_PROBE_SLOW_CYCLES) {
+    }
+  }
+  __syncwarp();
+  const long long elapsed = clock64() - start;
+  if (t == 0) {
+    results[3] = (int)elapsed;
+  }
+  if (t == 32) {
+    results[4] = (int)elapsed;
+  }
+  if (t == 63) {
+    results[5] = 0x1234;
+  }
+}
+
+flagcxResult_t flagcxTestLaunchSyncwarpProbe(int *results,
+                                             flagcxStream_t stream) {
+  if (results == nullptr || stream == nullptr) {
+    return flagcxInvalidArgument;
+  }
+  flagcxIluvatarSyncwarpProbeKernel<<<1, FLAGCX_SIMT_WIDTH, 0, stream->base>>>(
+      results);
+  cudaError_t err = cudaGetLastError();
+  return (err == cudaSuccess) ? flagcxSuccess : flagcxUnhandledDeviceError;
+}

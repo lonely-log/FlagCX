@@ -192,4 +192,9 @@ flagcxResult_t flagcxTestLaunchAtomicContract(uint32_t *value,
                                               flagcxStream_t stream);
 flagcxResult_t flagcxTestLaunchUnsupportedCoop(flagcxStream_t stream);
 
+// S3 wave/mask micro-benchmark. Writes six words (see the kernel comment); the
+// barrier measurement is timing-based, so the caller only has to synchronise.
+flagcxResult_t flagcxTestLaunchSyncwarpProbe(int *results,
+                                             flagcxStream_t stream);
+
 #endif // TEST_KERNEL_DEVICE_API_H_

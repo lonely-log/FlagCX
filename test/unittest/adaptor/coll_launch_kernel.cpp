@@ -30,6 +30,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 #include "adaptor.h"
@@ -361,6 +362,44 @@ TEST_F(LaunchKernelTest, FailedLaunchIsReportedThenConsumedByGetLastError) {
       << "the launch failure was not left in the device error record";
   EXPECT_EQ(deviceAdaptor->getLastError(), flagcxSuccess)
       << "getLastError() must consume the record it reports";
+}
+
+// S3: the partial-mask policy depends on two hardware facts that no header
+// documents. The probe measures waiting time rather than provoking a deadlock,
+// so it is safe on a shared device: every lane reaches the barrier and the
+// upper half merely arrives late. Under wave-wide semantics the early half
+// waits for the late half and got[3] grows to the size of got[4]; if the
+// barrier only covers the lanes that arrive, got[3] stays small. Either answer
+// is a valid finding - the assertions below only pin the invariants the policy
+// relies on.
+TEST_F(LaunchKernelTest, SyncwarpProbeReportsMaskWidthAndBarrierReach) {
+  ASSERT_GE(kResultsInts, 6);
+  int got[kResultsInts] = {};
+  ASSERT_FLAGCX_SUCCESS(devHandle_->deviceMemset(
+      devResults_, 0, kResultsInts * sizeof(int), flagcxMemDevice, stream_));
+  ASSERT_FLAGCX_SUCCESS(flagcxTestLaunchSyncwarpProbe(devResults_, stream_));
+  ASSERT_FLAGCX_SUCCESS(devHandle_->streamSynchronize(stream_));
+  ASSERT_FLAGCX_SUCCESS(devHandle_->deviceMemcpy(
+      got, devResults_, kResultsInts * sizeof(int), flagcxMemcpyDeviceToHost,
+      stream_));
+
+  // __activemask() must expose all lanes of the wave; the static_assert in
+  // iluvatar_platform_traits.h only checks the width of the type, never the
+  // value. Lanes 32-63 invisible here would break every cooperative primitive.
+  EXPECT_EQ(got[1], 64) << "activemask() popcount";
+  EXPECT_EQ(got[2], -1) << "activemask() high word must cover lanes 32-63";
+  // The barrier must be reachable from both halves of the wave.
+  EXPECT_EQ(got[5], 0x1234) << "lane 63 did not get past __syncwarp()";
+
+  RecordProperty("activemask_low", got[0]);
+  RecordProperty("activemask_popcount", got[1]);
+  RecordProperty("barrier_wait_early_half", got[3]);
+  RecordProperty("barrier_wait_late_half", got[4]);
+  printf("[  PROBE ] __activemask()=0x%08x popcount=%d | early-half barrier "
+         "wait=%d cycles, late-half total=%d cycles => __syncwarp() is %s\n",
+         got[0], got[1], got[3], got[4],
+         (got[3] * 2 >= got[4]) ? "WAVE-WIDE (a partial-mask sync would hang)"
+                                : "arrival-only (partial masks are supportable)");
 }
 
 } // namespace
