@@ -337,6 +337,32 @@ TEST_F(LaunchKernelTest, ReportsRuntimeRejectionInsteadOfSuccess) {
   }
 }
 
+// A rejected launch must leave its error retrievable, and the first read must
+// consume it: ixcudaAdaptorLaunchKernel() deliberately leaves the sticky state
+// set, so getLastError() is what clears it. A second read must see a clean
+// slate, otherwise the record would leak into whatever runs next.
+TEST_F(LaunchKernelTest, FailedLaunchIsReportedThenConsumedByGetLastError) {
+  if (deviceAdaptor == nullptr || deviceAdaptor->launchKernel == nullptr ||
+      deviceAdaptor->getLastError == nullptr) {
+    GTEST_SKIP() << "launchKernel/getLastError is not implemented on this "
+                    "platform";
+  }
+
+  int *results = devResults_;
+  void *args[] = {&results};
+  // An unregistered entry point cannot be launched, so the runtime rejects it
+  // without executing anything (measured: cudaErrorInvalidDeviceFunction).
+  void *notAKernel = reinterpret_cast<void *>(0x1000);
+
+  EXPECT_EQ(deviceAdaptor->launchKernel(notAKernel, 1, 1, 1, 1, 1, 1, args, 0,
+                                        stream_, nullptr),
+            flagcxUnhandledDeviceError);
+  EXPECT_EQ(deviceAdaptor->getLastError(), flagcxUnhandledDeviceError)
+      << "the launch failure was not left in the device error record";
+  EXPECT_EQ(deviceAdaptor->getLastError(), flagcxSuccess)
+      << "getLastError() must consume the record it reports";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {

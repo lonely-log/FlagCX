@@ -21,6 +21,7 @@ int queryCalls = 0;
 int ipcCreateCalls = 0;
 int ipcGetCalls = 0;
 int ipcFreeCalls = 0;
+int lastErrorCalls = 0;
 
 flagcxResult_t mockPointerQuery(const void *, int *ptrType) {
   ++queryCalls;
@@ -49,7 +50,10 @@ flagcxResult_t mockIpcFree(flagcxIpcMemHandle_t handle) {
   return flagcxSuccess;
 }
 
-flagcxResult_t mockGetLastError() { return flagcxSuccess; }
+flagcxResult_t mockGetLastError() {
+  ++lastErrorCalls;
+  return flagcxSuccess;
+}
 
 class PointerClassificationTest : public ::testing::Test {
 protected:
@@ -70,6 +74,7 @@ protected:
     ipcCreateCalls = 0;
     ipcGetCalls = 0;
     ipcFreeCalls = 0;
+    lastErrorCalls = 0;
   }
 
   void TearDown() override { deviceAdaptor = savedAdaptor_; }
@@ -121,6 +126,7 @@ TEST_F(PointerClassificationTest, GpuTypeSurvivesOptionalIpcExportFailure) {
   EXPECT_EQ(ipcCreateCalls, 1);
   EXPECT_EQ(ipcGetCalls, 1);
   EXPECT_EQ(ipcFreeCalls, 1);
+  EXPECT_EQ(lastErrorCalls, 1);
   EXPECT_EQ(ipcHandleSize, 0u);
 }
 
