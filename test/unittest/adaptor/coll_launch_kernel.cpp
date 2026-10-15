@@ -31,6 +31,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdarg>
+#include <cstdlib>
 
 #include "adaptor.h"
 #include "device_api.h"
@@ -75,6 +77,26 @@ namespace {
   } while (0)
 
 constexpr size_t kWindowBytes = 4u << 20; // symmetric window, 4 MiB
+// Uniform probe logging: every platform probe appends one "PROBE|..." line to a
+// single file, so a run leaves one machine-greppable log next to the gtest
+// output instead of scattering numbers across stdout. Override the path with
+// FLAGCX_ILUVATAR_PROBE_LOG.
+static void flagcxProbeLogLine(const char *fmt, ...) {
+  const char *path = getenv("FLAGCX_ILUVATAR_PROBE_LOG");
+  if (path == nullptr || path[0] == '\0')
+    path = "/tmp/flagcx_iluvatar_probe.log";
+  FILE *f = fopen(path, "a");
+  if (f == nullptr)
+    return;
+  va_list ap;
+  va_start(ap, fmt);
+  fprintf(f, "PROBE|");
+  vfprintf(f, fmt, ap);
+  fprintf(f, "\n");
+  va_end(ap);
+  fclose(f);
+}
+
 constexpr int kResultsInts = 16;
 
 class LaunchKernelTest : public ::testing::Test {
@@ -349,4 +371,82 @@ int main(int argc, char **argv) {
   int testResult = RUN_ALL_TESTS();
   MPI_Finalize();
   return testResult;
+}
+
+// S3 / D2: coop sync matrix. Same shape in every cell (one 128-thread block,
+// two 64-lane waves, one known delay D), only the cooperative group and the
+// delay position change:
+//   delay-other-wave      the other wave arrives late -> only a block-scoped
+//                         sync can hold the early wave
+//   delay-same-wave-upper the upper half of the early wave's own wave arrives
+//                         late -> any real sync (block or wave scoped) holds it
+// tid 0 and tid 31 are always early; the delayed thread's own elapsed value and
+// tid 127's sentinel are the self-checks. Every cell is appended to the unified
+// probe log as one PROBE| line.
+TEST_F(LaunchKernelTest, CoopSyncMatrixReportsScopeAndReach) {
+  struct Cell {
+    int coop;
+    int delay;
+    const char *coopName;
+    const char *delayName;
+    bool expectHeld;
+  } cells[] = {
+      {FLAGCX_TEST_COOP_MATRIX_BLOCK, FLAGCX_TEST_COOP_MATRIX_DELAY_OTHER_WAVE,
+       "BLOCK", "delay-other-wave", true},
+      {FLAGCX_TEST_COOP_MATRIX_BLOCK,
+       FLAGCX_TEST_COOP_MATRIX_DELAY_SAME_WAVE_UPPER, "BLOCK",
+       "delay-same-wave-upper", true},
+      {FLAGCX_TEST_COOP_MATRIX_TILESPAN,
+       FLAGCX_TEST_COOP_MATRIX_DELAY_OTHER_WAVE, "TILESPAN",
+       "delay-other-wave", true},
+      {FLAGCX_TEST_COOP_MATRIX_TILESPAN,
+       FLAGCX_TEST_COOP_MATRIX_DELAY_SAME_WAVE_UPPER, "TILESPAN",
+       "delay-same-wave-upper", true},
+      {FLAGCX_TEST_COOP_MATRIX_WARP, FLAGCX_TEST_COOP_MATRIX_DELAY_OTHER_WAVE,
+       "WARP", "delay-other-wave", false},
+      {FLAGCX_TEST_COOP_MATRIX_WARP,
+       FLAGCX_TEST_COOP_MATRIX_DELAY_SAME_WAVE_UPPER, "WARP",
+       "delay-same-wave-upper", true}};
+  for (size_t c = 0; c < sizeof(cells) / sizeof(cells[0]); ++c) {
+    int got[kResultsInts] = {};
+    ASSERT_FLAGCX_SUCCESS(devHandle_->deviceMemset(
+        devResults_, 0, kResultsInts * sizeof(int), flagcxMemDevice, stream_));
+    ASSERT_FLAGCX_SUCCESS(flagcxTestLaunchCoopMatrixProbe(
+        cells[c].coop, cells[c].delay, devResults_, stream_));
+    ASSERT_FLAGCX_SUCCESS(devHandle_->streamSynchronize(stream_));
+    ASSERT_FLAGCX_SUCCESS(devHandle_->deviceMemcpy(
+        got, devResults_, kResultsInts * sizeof(int), flagcxMemcpyDeviceToHost,
+        stream_));
+    const int early = got[0];
+    const int early2 = got[1];
+    const int delayed = got[2];
+    const bool held = early > delayed / 2;
+    const bool held2 = early2 > delayed / 2;
+    printf("[  COOP  ] %-9s x %-22s early(tid0)=%-9d early(tid31)=%-9d "
+           "delayed=%-9d sentinel=0x%x => %s\n",
+           cells[c].coopName, cells[c].delayName, early, early2, delayed, got[3],
+           held ? "HELD" : "RELEASED EARLY");
+    fflush(stdout);
+    flagcxProbeLogLine("coop-sync|%s|%s|early_tid0=%d|early_tid31=%d|"
+                       "delayed=%d|sentinel=0x%x|%s",
+                       cells[c].coopName, cells[c].delayName, early, early2,
+                       delayed, got[3], held ? "HELD" : "RELEASED_EARLY");
+    RecordProperty("coop_early_elapsed", early);
+    RecordProperty("coop_delayed_elapsed", delayed);
+    EXPECT_EQ(got[3], 0xABCD) << cells[c].coopName << "/" << cells[c].delayName
+                              << ": no thread passed the sync";
+    EXPECT_GT(delayed, 1000000)
+        << cells[c].coopName << "/" << cells[c].delayName
+        << ": the delayed threads did not spin";
+    EXPECT_EQ(held, cells[c].expectHeld)
+        << cells[c].coopName << "/" << cells[c].delayName
+        << ": tid 0 elapsed does not match the expected scope";
+    EXPECT_EQ(held2, held) << cells[c].coopName << "/" << cells[c].delayName
+                           << ": the two early threads disagree";
+  }
+  printf("[  COOP  ] unified probe log: %s\n",
+         getenv("FLAGCX_ILUVATAR_PROBE_LOG") != nullptr
+             ? getenv("FLAGCX_ILUVATAR_PROBE_LOG")
+             : "/tmp/flagcx_iluvatar_probe.log");
+  fflush(stdout);
 }

@@ -89,3 +89,111 @@ flagcxResult_t flagcxTestLaunchUnsupportedCoop(flagcxStream_t stream) {
   cudaError_t err = cudaGetLastError();
   return (err == cudaSuccess) ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
+
+// ===========================================================================
+// S3 / D2: coop sync matrix - one shape, three cooperative groups, two delay
+// positions.
+//
+// Block of 128 threads = two complete 64-lane waves on CoreX, and every cell
+// runs the same code path except for the two template parameters:
+//   COOP   BLOCK | TILESPAN(0, blockDim/simtWidth, 0) | WARP
+//   DELAY  other-wave (wave 1 late) | same-wave-upper (tid 32..63 late)
+//
+// Every thread calls its group sync exactly once, so no cell can deadlock, and
+// tid 0 / tid 31 always belong to the early set: their elapsed time says whether
+// the sync held them until the delayed threads arrived.
+//   delay-other-wave       -> separates block scope from wave scope
+//   delay-same-wave-upper  -> separates "a wave sync really waits for its own
+//                             lanes" from "it does nothing"
+//
+// Self-checks: the delayed thread's own elapsed proves the spin happened, and
+// tid 127 writes a sentinel after the sync so a deadlock cannot look like data.
+//
+// results: [0]=tid 0  [1]=tid 31  [2]=delayed thread  [3]=sentinel
+// ===========================================================================
+#if !defined(FLAGCX_ILUVATAR_PROBE_SLOW_CYCLES)
+// Self-contained on branches that do not carry the S3 header changes.
+#define FLAGCX_ILUVATAR_PROBE_SLOW_CYCLES 2000000
+#endif
+
+template <int COOP, int DELAY>
+__global__ void flagcxIluvatarCoopMatrixProbeKernel(int *results) {
+  const int t = FLAGCX_THREAD_IDX_X;
+  const int wave = t / FLAGCX_SIMT_WIDTH;
+  const bool delayed =
+      (DELAY == FLAGCX_TEST_COOP_MATRIX_DELAY_OTHER_WAVE)
+          ? (wave == 1)
+          : (wave == 0 && t >= FLAGCX_SIMT_WIDTH / 2);
+  const long long start = clock64();
+  if (delayed) {
+    const long long spinStart = clock64();
+    int guard = 0;
+    while (++guard < 20000000 && clock64() - spinStart <
+                                     (long long)
+                                         FLAGCX_ILUVATAR_PROBE_SLOW_CYCLES) {
+    }
+  }
+  if (COOP == FLAGCX_TEST_COOP_MATRIX_BLOCK) {
+    flagcxCoopBlock{}.sync();
+  } else if (COOP == FLAGCX_TEST_COOP_MATRIX_TILESPAN) {
+    flagcxCoopTileSpan(0, (int)(FLAGCX_BLOCK_DIM_X / FLAGCX_SIMT_WIDTH), 0)
+        .sync();
+  } else {
+    flagcxCoopWarp{}.sync();
+  }
+  const long long elapsed = clock64() - start;
+  if (t == 0)
+    results[0] = (int)elapsed;
+  if (t == FLAGCX_SIMT_WIDTH / 2 - 1)
+    results[1] = (int)elapsed;
+  const int delayedTid = (DELAY == FLAGCX_TEST_COOP_MATRIX_DELAY_OTHER_WAVE)
+                             ? FLAGCX_SIMT_WIDTH
+                             : FLAGCX_SIMT_WIDTH / 2;
+  if (t == delayedTid)
+    results[2] = (int)elapsed;
+  if (t == 2 * FLAGCX_SIMT_WIDTH - 1)
+    results[3] = 0xABCD;
+}
+
+flagcxResult_t flagcxTestLaunchCoopMatrixProbe(int coop, int delay, int *results,
+                                               flagcxStream_t stream) {
+  if (results == nullptr || stream == nullptr)
+    return flagcxInvalidArgument;
+  const int block = 2 * FLAGCX_SIMT_WIDTH; // two complete waves
+  const int other = FLAGCX_TEST_COOP_MATRIX_DELAY_OTHER_WAVE;
+  const int same = FLAGCX_TEST_COOP_MATRIX_DELAY_SAME_WAVE_UPPER;
+  if (coop == FLAGCX_TEST_COOP_MATRIX_BLOCK) {
+    if (delay == other)
+      flagcxIluvatarCoopMatrixProbeKernel<FLAGCX_TEST_COOP_MATRIX_BLOCK, other>
+          <<<1, block, 0, stream->base>>>(results);
+    else if (delay == same)
+      flagcxIluvatarCoopMatrixProbeKernel<FLAGCX_TEST_COOP_MATRIX_BLOCK, same>
+          <<<1, block, 0, stream->base>>>(results);
+    else
+      return flagcxInvalidArgument;
+  } else if (coop == FLAGCX_TEST_COOP_MATRIX_TILESPAN) {
+    if (delay == other)
+      flagcxIluvatarCoopMatrixProbeKernel<FLAGCX_TEST_COOP_MATRIX_TILESPAN,
+                                          other>
+          <<<1, block, 0, stream->base>>>(results);
+    else if (delay == same)
+      flagcxIluvatarCoopMatrixProbeKernel<FLAGCX_TEST_COOP_MATRIX_TILESPAN,
+                                          same>
+          <<<1, block, 0, stream->base>>>(results);
+    else
+      return flagcxInvalidArgument;
+  } else if (coop == FLAGCX_TEST_COOP_MATRIX_WARP) {
+    if (delay == other)
+      flagcxIluvatarCoopMatrixProbeKernel<FLAGCX_TEST_COOP_MATRIX_WARP, other>
+          <<<1, block, 0, stream->base>>>(results);
+    else if (delay == same)
+      flagcxIluvatarCoopMatrixProbeKernel<FLAGCX_TEST_COOP_MATRIX_WARP, same>
+          <<<1, block, 0, stream->base>>>(results);
+    else
+      return flagcxInvalidArgument;
+  } else {
+    return flagcxInvalidArgument;
+  }
+  cudaError_t err = cudaGetLastError();
+  return (err == cudaSuccess) ? flagcxSuccess : flagcxUnhandledDeviceError;
+}

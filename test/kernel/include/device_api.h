@@ -192,4 +192,19 @@ flagcxResult_t flagcxTestLaunchAtomicContract(uint32_t *value,
                                               flagcxStream_t stream);
 flagcxResult_t flagcxTestLaunchUnsupportedCoop(flagcxStream_t stream);
 
+// S3 / D2: coop sync matrix - three cooperative groups x two delay positions.
+// results: [0]=tid 0 [1]=tid 31 [2]=delayed thread [3]=sentinel.
+enum {
+  FLAGCX_TEST_COOP_MATRIX_BLOCK = 0,
+  FLAGCX_TEST_COOP_MATRIX_TILESPAN = 1,
+  FLAGCX_TEST_COOP_MATRIX_WARP = 2
+};
+enum {
+  FLAGCX_TEST_COOP_MATRIX_DELAY_OTHER_WAVE = 0,
+  FLAGCX_TEST_COOP_MATRIX_DELAY_SAME_WAVE_UPPER = 1
+};
+flagcxResult_t flagcxTestLaunchCoopMatrixProbe(int coop, int delay, int *results,
+                                               flagcxStream_t stream);
+
+
 #endif // TEST_KERNEL_DEVICE_API_H_
