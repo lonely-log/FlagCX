@@ -33,21 +33,21 @@
 typedef PlatformTraits<IluvatarPlatform>::Atomic A;
 typedef flagcxDeviceMemoryOrder_t Order;
 
-#define T3_NEG 0
-#define T3_ADD 1
-#define T3_SUB 2
-#define T3_OR 3
-#define T3_AND 4
-#define T3_EXCH 5
-#define T3_CAS 6
+#define RMW_NEG 0
+#define RMW_ADD 1
+#define RMW_SUB 2
+#define RMW_OR 3
+#define RMW_AND 4
+#define RMW_EXCH 5
+#define RMW_CAS 6
 
 template <int OP>
-__global__ void t3Kernel(unsigned *p, unsigned *sink, int *aux,
+__global__ void rmwKernel(unsigned *p, unsigned *sink, int *aux,
                          unsigned perThread) {
   const unsigned gtid = blockIdx.x * blockDim.x + threadIdx.x;
   const Order ord = flagcxDeviceMemoryOrderRelaxed;
 
-  if (OP == T3_NEG) {
+  if (OP == RMW_NEG) {
     // Deliberate non-atomic read-modify-write: volatile so it cannot be folded
     // into a single atomic, but still a lost-update generator.
     volatile unsigned *vp = p;
@@ -55,19 +55,19 @@ __global__ void t3Kernel(unsigned *p, unsigned *sink, int *aux,
       const unsigned v = *vp;
       *vp = v + 1u;
     }
-  } else if (OP == T3_ADD) {
+  } else if (OP == RMW_ADD) {
     for (unsigned i = 0; i < perThread; ++i)
       (void)A::fetchAdd(p, 1u, ord);
-  } else if (OP == T3_SUB) {
+  } else if (OP == RMW_SUB) {
     for (unsigned i = 0; i < perThread; ++i)
       (void)A::fetchSub(p, 1u, ord);
-  } else if (OP == T3_OR) {
+  } else if (OP == RMW_OR) {
     const unsigned bit = 1u << (gtid & 31u);
     (void)A::fetchOr(p, bit, ord);
-  } else if (OP == T3_AND) {
+  } else if (OP == RMW_AND) {
     const unsigned bit = 1u << (gtid & 31u);
     (void)A::fetchAnd(p, ~bit, ord);
-  } else if (OP == T3_EXCH) {
+  } else if (OP == RMW_EXCH) {
     sink[gtid] = A::exchange(p, gtid + 1u, ord);
   } else {
     // CAS retry loop. compareExchange writes the observed value back into
@@ -112,14 +112,14 @@ static int cmpU(const void *a, const void *b) {
 int main() {
   const int block = 256;
   const Cell cells[] = {
-      {T3_NEG, "NEG(non-atomic +=)", 2, 1000u, 0u},
-      {T3_ADD, "fetchAdd", 1, 1000u, 0u},
-      {T3_ADD, "fetchAdd", 2, 1000u, 0u},
-      {T3_SUB, "fetchSub", 2, 1000u, 0u}, // init filled in below
-      {T3_OR, "fetchOr", 2, 1u, 0u},
-      {T3_AND, "fetchAnd", 2, 1u, 0xFFFFFFFFu},
-      {T3_EXCH, "exchange", 2, 1u, 0u},
-      {T3_CAS, "compareExchange", 2, 1u, 0u},
+      {RMW_NEG, "NEG(non-atomic +=)", 2, 1000u, 0u},
+      {RMW_ADD, "fetchAdd", 1, 1000u, 0u},
+      {RMW_ADD, "fetchAdd", 2, 1000u, 0u},
+      {RMW_SUB, "fetchSub", 2, 1000u, 0u}, // init filled in below
+      {RMW_OR, "fetchOr", 2, 1u, 0u},
+      {RMW_AND, "fetchAnd", 2, 1u, 0xFFFFFFFFu},
+      {RMW_EXCH, "exchange", 2, 1u, 0u},
+      {RMW_CAS, "compareExchange", 2, 1u, 0u},
   };
   const int kCells = (int)(sizeof(cells) / sizeof(cells[0]));
 
@@ -134,7 +134,7 @@ int main() {
     const unsigned nThreads = (unsigned)(cells[c].grid * block);
     const unsigned total = nThreads * cells[c].perThread;
     unsigned init = cells[c].init;
-    if (cells[c].op == T3_SUB) init = total;
+    if (cells[c].op == RMW_SUB) init = total;
 
     CK(cudaMemset(p, 0, sizeof(unsigned)));
     if (init != 0u) CK(cudaMemcpy(p, &init, sizeof(unsigned), cudaMemcpyHostToDevice));
@@ -142,26 +142,26 @@ int main() {
     CK(cudaMemset(aux, 0, 2 * sizeof(int)));
 
     switch (cells[c].op) {
-      case T3_NEG:
-        t3Kernel<T3_NEG><<<cells[c].grid, block>>>(p, sink, aux, cells[c].perThread);
+      case RMW_NEG:
+        rmwKernel<RMW_NEG><<<cells[c].grid, block>>>(p, sink, aux, cells[c].perThread);
         break;
-      case T3_ADD:
-        t3Kernel<T3_ADD><<<cells[c].grid, block>>>(p, sink, aux, cells[c].perThread);
+      case RMW_ADD:
+        rmwKernel<RMW_ADD><<<cells[c].grid, block>>>(p, sink, aux, cells[c].perThread);
         break;
-      case T3_SUB:
-        t3Kernel<T3_SUB><<<cells[c].grid, block>>>(p, sink, aux, cells[c].perThread);
+      case RMW_SUB:
+        rmwKernel<RMW_SUB><<<cells[c].grid, block>>>(p, sink, aux, cells[c].perThread);
         break;
-      case T3_OR:
-        t3Kernel<T3_OR><<<cells[c].grid, block>>>(p, sink, aux, cells[c].perThread);
+      case RMW_OR:
+        rmwKernel<RMW_OR><<<cells[c].grid, block>>>(p, sink, aux, cells[c].perThread);
         break;
-      case T3_AND:
-        t3Kernel<T3_AND><<<cells[c].grid, block>>>(p, sink, aux, cells[c].perThread);
+      case RMW_AND:
+        rmwKernel<RMW_AND><<<cells[c].grid, block>>>(p, sink, aux, cells[c].perThread);
         break;
-      case T3_EXCH:
-        t3Kernel<T3_EXCH><<<cells[c].grid, block>>>(p, sink, aux, cells[c].perThread);
+      case RMW_EXCH:
+        rmwKernel<RMW_EXCH><<<cells[c].grid, block>>>(p, sink, aux, cells[c].perThread);
         break;
       default:
-        t3Kernel<T3_CAS><<<cells[c].grid, block>>>(p, sink, aux, cells[c].perThread);
+        rmwKernel<RMW_CAS><<<cells[c].grid, block>>>(p, sink, aux, cells[c].perThread);
         break;
     }
     CK(cudaDeviceSynchronize());
@@ -174,23 +174,23 @@ int main() {
     char detail[128] = "";
     int ok = 0;
     unsigned expect = 0;
-    if (cells[c].op == T3_NEG) {
+    if (cells[c].op == RMW_NEG) {
       ok = (got < total);
       snprintf(detail, sizeof(detail), "expect <%u (lost updates)", total);
-    } else if (cells[c].op == T3_ADD) {
+    } else if (cells[c].op == RMW_ADD) {
       expect = total;
       ok = (got == expect);
       snprintf(detail, sizeof(detail), "expect %u", expect);
-    } else if (cells[c].op == T3_SUB) {
+    } else if (cells[c].op == RMW_SUB) {
       ok = (got == 0u);
       snprintf(detail, sizeof(detail), "expect 0");
-    } else if (cells[c].op == T3_OR) {
+    } else if (cells[c].op == RMW_OR) {
       ok = (got == 0xFFFFFFFFu);
       snprintf(detail, sizeof(detail), "expect 0xffffffff");
-    } else if (cells[c].op == T3_AND) {
+    } else if (cells[c].op == RMW_AND) {
       ok = (got == 0u);
       snprintf(detail, sizeof(detail), "expect 0");
-    } else if (cells[c].op == T3_EXCH) {
+    } else if (cells[c].op == RMW_EXCH) {
       CK(cudaMemcpy(host, sink, nThreads * sizeof(unsigned), cudaMemcpyDeviceToHost));
       qsort(host, nThreads, sizeof(unsigned), cmpU);
       // The verdict is "every exchange handed back a distinct previous value".

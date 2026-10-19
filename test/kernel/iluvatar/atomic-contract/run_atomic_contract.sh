@@ -8,7 +8,7 @@
 # Logs, assembly and IR are written under OUT and are deliberately not part of
 # the source tree.
 #
-#   REPO   repo root          (default: five levels up from this script)
+#   REPO   repo root          (default: four levels up from this script)
 #   OUT    output directory   (default: /tmp/atomic-contract)
 #   CLANG  CoreX clang        (default: /usr/local/corex/bin/clang)
 set -u
@@ -34,45 +34,46 @@ echo "repo   : $REPO"
 echo "script : $HERE"
 echo "traits : $(sha256sum "$REPO/flagcx/adaptor/include/device_api/iluvatar_platform_traits.h" | cut -d' ' -f1)"
 echo "clang  : $($CLANG --version | head -1)"
-for f in order_scope_dispatch.py publish_observe_order.cu rmw_atomicity.cu \
+for f in order_scope_compile.py load_store_order.cu rmw_atomicity.cu \
          value_contract.cu value_contract_64bit_rmw_must_be_rejected.cu; do
   echo "src    : $(sha256sum "$HERE/$f" | cut -d' ' -f1)  $f"
 done
 
-# ------------------------------------------------- 1) compile-time dispatch
+# ------------------------------------------------------- 1) compile-time check
 echo
-echo "########## order-scope-dispatch (compile-time) ##########"
-# The generator makes its own output directory, but the shell creates the
+echo "########## order-scope-compile (compile-time) ##########"
+# The generator creates its own output directory, but the shell creates the
 # redirect target first, so the directory has to exist before this line.
-DISPATCH_OUT="$OUT/order-scope-dispatch"
-mkdir -p "$DISPATCH_OUT"
-OUT="$DISPATCH_OUT" REPO="$REPO" CLANG="$CLANG" \
-  timeout 900 python3 "$HERE/order_scope_dispatch.py" > "$DISPATCH_OUT/dispatch.log" 2>&1
+COMPILE_OUT="$OUT/order-scope-compile"
+COMPILE_LOG="$COMPILE_OUT/order_scope_compile_run1.log"
+mkdir -p "$COMPILE_OUT"
+OUT="$COMPILE_OUT" REPO="$REPO" CLANG="$CLANG" \
+  timeout 900 python3 "$HERE/order_scope_compile.py" > "$COMPILE_LOG" 2>&1
 echo "rc=$?"
-grep -aE "PROBE\||kernels found|PREDICTION|distinct groups" "$DISPATCH_OUT/dispatch.log"
+grep -aE "PROBE\||kernels found|PREDICTION|distinct groups" "$COMPILE_LOG"
 
-# ----------------------------------------------------- 2) publish / observe
+# ------------------------------------------------------------ 2) load / store
 echo
-echo "########## publish-observe (runtime) ##########"
-$CLANG $FLAGS $INC -o publish_observe_order "$HERE/publish_observe_order.cu" $LNK 2>&1 \
+echo "########## load-store-order (runtime) ##########"
+$CLANG $FLAGS $INC -o load_store_order "$HERE/load_store_order.cu" $LNK 2>&1 \
   | grep -v "not unrolled" | head -5
-if [ -x ./publish_observe_order ]; then
+if [ -x ./load_store_order ]; then
   for r in 1 2 3; do
     echo "--- run $r ---"
-    timeout -s KILL 600 ./publish_observe_order > "publish_observe_order_run$r.log" 2>&1
+    timeout -s KILL 600 ./load_store_order > "load_store_order_run$r.log" 2>&1
     echo "rc=$?"
-    grep -aE "PROBE\||DONE" "publish_observe_order_run$r.log"
+    grep -aE "PROBE\||DONE" "load_store_order_run$r.log"
     [ -x /tmp/devcheck ] && timeout -s KILL 60 /tmp/devcheck 2>&1 | tail -1
   done
   for r in 1 2 3; do
-    grep -ah "PROBE|" "publish_observe_order_run$r.log" | sed 's/=-\?[0-9]*/=N/g' > "po_v$r.txt"
+    grep -ah "PROBE|" "load_store_order_run$r.log" | sed 's/=-\?[0-9]*/=N/g' > "ls_v$r.txt"
   done
-  if diff -q po_v1.txt po_v2.txt >/dev/null && diff -q po_v1.txt po_v3.txt >/dev/null; then
+  if diff -q ls_v1.txt ls_v2.txt >/dev/null && diff -q ls_v1.txt ls_v3.txt >/dev/null; then
     echo "verdicts identical across 3 runs"
   else
-    echo "VERDICT DIFFERS"; diff po_v1.txt po_v2.txt || true
+    echo "VERDICT DIFFERS"; diff ls_v1.txt ls_v2.txt || true
   fi
-  echo "MISMATCH per run: $(for r in 1 2 3; do printf '%s ' "$(grep -ac 'MISMATCH$' "publish_observe_order_run$r.log")"; done)"
+  echo "MISMATCH per run: $(for r in 1 2 3; do printf '%s ' "$(grep -ac 'MISMATCH$' "load_store_order_run$r.log")"; done)"
 else
   echo "NO BINARY"
 fi
@@ -146,10 +147,10 @@ echo
 echo "########## counts ##########"
 # Count only the per-run logs. harness.log holds the same lines again, so a
 # glob over *.log would count everything twice.
-LOGS="publish_observe_order_run1.log publish_observe_order_run2.log publish_observe_order_run3.log
+LOGS="load_store_order_run1.log load_store_order_run2.log load_store_order_run3.log
       rmw_atomicity_run1.log rmw_atomicity_run2.log rmw_atomicity_run3.log
       value_contract_run1.log value_contract_run2.log value_contract_run3.log
-      order-scope-dispatch/dispatch.log"
+      order-scope-compile/order_scope_compile_run1.log"
 echo "OK        : $(cat $LOGS 2>/dev/null | grep -o '|OK$' | wc -l)"
 echo "MISMATCH  : $(cat $LOGS 2>/dev/null | grep -o 'MISMATCH$' | wc -l)"
 echo "VIOLATION : $(cat $LOGS 2>/dev/null | grep -o 'VIOLATION$' | wc -l)"

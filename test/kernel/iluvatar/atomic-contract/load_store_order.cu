@@ -1,4 +1,4 @@
-// Publish/observe edge: does the fence that `struct Atomic` emits actually work?
+// Load/store ordering: does the fence that `struct Atomic` emits actually work?
 //
 // The compile-time side already proved (identical ISA over 20 combinations) that
 //   - Atomic::load  emits no fence for any order or scope
@@ -35,7 +35,7 @@ typedef flagcxDeviceMemoryOrder_t Ord;
 #define ITER (1u << 20)
 #define WINDOW 800u
 
-__device__ __forceinline__ void t2Delay(unsigned cycles) {
+__device__ __forceinline__ void knownDelay(unsigned cycles) {
   const long long s = clock64();
   while (clock64() - s < (long long)cycles) {
   }
@@ -43,7 +43,7 @@ __device__ __forceinline__ void t2Delay(unsigned cycles) {
 
 // counters: [0]=violations [1]=timeouts [2]=raced [3]=producer_done
 template <int PUB_ORDER, int CON_ORDER, int NEGATIVE>
-__global__ void t2MpKernel(unsigned *data, unsigned *flag, int *c,
+__global__ void mpLitmusKernel(unsigned *data, unsigned *flag, int *c,
                            unsigned int iter, unsigned int window) {
   if (blockIdx.x == 0u) {
     for (unsigned int i = 0; i < iter; ++i) {
@@ -51,13 +51,13 @@ __global__ void t2MpKernel(unsigned *data, unsigned *flag, int *c,
       if (NEGATIVE) {
         // Deliberate protocol break: publish first, payload after.
         A::store(&flag[i], v, (Ord)PUB_ORDER);
-        t2Delay(window);
+        knownDelay(window);
         data[i] = v;
       } else {
-        t2Delay(window / 2u);              // publisher lags: consumer arrives first
+        knownDelay(window / 2u);              // publisher lags: consumer arrives first
         data[i] = v;                        // payload, plain write
         A::store(&flag[i], v, (Ord)PUB_ORDER);   // publication edge under test
-        t2Delay(window / 2u);
+        knownDelay(window / 2u);
       }
     }
     c[3] = 1;
@@ -85,7 +85,7 @@ __global__ void t2MpKernel(unsigned *data, unsigned *flag, int *c,
 
 // Positive control: ordering is guaranteed by the block barrier, so any
 // violation here means the measurement path is broken.
-__global__ void t2PositiveKernel(unsigned *data, unsigned *flag, int *c,
+__global__ void barrierOrderedKernel(unsigned *data, unsigned *flag, int *c,
                                  unsigned int iter) {
   for (unsigned int i = 0; i < iter; ++i) {
     __syncthreads();
@@ -148,30 +148,30 @@ int main() {
 
     switch (cells[k].id) {
       case 0:
-        t2MpKernel<flagcxDeviceMemoryOrderRelease,
+        mpLitmusKernel<flagcxDeviceMemoryOrderRelease,
                    flagcxDeviceMemoryOrderRelaxed, 1>
             <<<2, 1>>>(dData, dFlag, dC, ITER, WINDOW);
         break;
       case 1:
-        t2PositiveKernel<<<1, 2>>>(dData, dFlag, dC, ITER);
+        barrierOrderedKernel<<<1, 2>>>(dData, dFlag, dC, ITER);
         break;
       case 2:
-        t2MpKernel<flagcxDeviceMemoryOrderRelease,
+        mpLitmusKernel<flagcxDeviceMemoryOrderRelease,
                    flagcxDeviceMemoryOrderRelaxed, 0>
             <<<2, 1>>>(dData, dFlag, dC, ITER, WINDOW);
         break;
       case 3:
-        t2MpKernel<flagcxDeviceMemoryOrderRelaxed,
+        mpLitmusKernel<flagcxDeviceMemoryOrderRelaxed,
                    flagcxDeviceMemoryOrderRelaxed, 0>
             <<<2, 1>>>(dData, dFlag, dC, ITER, WINDOW);
         break;
       case 4:
-        t2MpKernel<flagcxDeviceMemoryOrderRelease,
+        mpLitmusKernel<flagcxDeviceMemoryOrderRelease,
                    flagcxDeviceMemoryOrderAcquire, 0>
             <<<2, 1>>>(dData, dFlag, dC, ITER, WINDOW);
         break;
       default:
-        t2MpKernel<flagcxDeviceMemoryOrderRelaxed,
+        mpLitmusKernel<flagcxDeviceMemoryOrderRelaxed,
                    flagcxDeviceMemoryOrderAcquire, 0>
             <<<2, 1>>>(dData, dFlag, dC, ITER, WINDOW);
         break;
@@ -182,7 +182,7 @@ int main() {
     const int many = got[0] > 0;
     const int ok = (many == cells[k].expectViolations) && (got[1] == 0) &&
                    (got[3] == 1);
-    printf("PROBE|publish-observe|%-24s|violations=%-8d|timeouts=%-3d|raced=%-8d|"
+    printf("PROBE|load-store-order|%-24s|violations=%-8d|timeouts=%-3d|raced=%-8d|"
            "producer_done=%d|expect=%s|%s\n",
            cells[k].name, got[0], got[1], got[2], got[3],
            cells[k].expectViolations ? "many" : "none", ok ? "OK" : "MISMATCH");
@@ -192,6 +192,6 @@ int main() {
   cudaFree(dData);
   cudaFree(dFlag);
   cudaFree(dC);
-  printf("PUBLISH_OBSERVE_DONE\n");
+  printf("LOAD_STORE_ORDER_DONE\n");
   return 0;
 }

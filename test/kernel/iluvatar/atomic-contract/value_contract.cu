@@ -24,7 +24,7 @@ typedef flagcxDeviceMemoryOrder_t Ord;
 #define REL (flagcxDeviceMemoryOrderRelease)
 #define ACQ (flagcxDeviceMemoryOrderAcquire)
 
-__global__ void t4Kernel(unsigned *p, unsigned long long *q, unsigned *out,
+__global__ void valueContractKernel(unsigned *p, unsigned long long *q, unsigned *out,
                          unsigned long long *out64) {
   if (threadIdx.x != 0)
     return;
@@ -134,7 +134,7 @@ int main() {
   CK(cudaMemset(out, 0, 32 * sizeof(unsigned)));
   CK(cudaMemset(out64, 0, 4 * sizeof(unsigned long long)));
 
-  t4Kernel<<<1, 1>>>(p, q, out, out64);
+  valueContractKernel<<<1, 1>>>(p, q, out, out64);
   CK(cudaDeviceSynchronize());
 
   unsigned got[32] = {0};
