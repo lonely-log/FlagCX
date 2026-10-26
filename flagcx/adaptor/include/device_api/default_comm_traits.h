@@ -844,9 +844,32 @@ struct CommTraits<DefaultBackend<PlatformTag>> {
         size_t srcDataOff = toDataOffset(src, srcOff);
         size_t dstDataOff = toDataOffset(dst, dstOff);
         if (canFuseSignal(ra)) {
-          enqueueFifoPutSignal(srcDataOff, dstDataOff, bytes, getSignalIdx(ra),
-                               (uint32_t)getSignalValue(ra), worldPeer,
-                               src.getMrIndex(), dst.getMrIndex());
+          // Prefer an in-kernel atomic for the signal: several peers may add to
+          // the same word in one receiver and a host-side read/add/write loses
+          // increments. Post the data first, wait for it to land, then bump the
+          // counter, which keeps the original data-then-signal ordering.
+          validateCompletionValue(getSignalValue(ra));
+          uint64_t *peerSignal =
+              (worldPeer >= 0 && worldPeer < _dc.getSize())
+                  ? _dc.getProxySignalPeerPtr(worldPeer)
+                  : nullptr;
+          if (peerSignal != nullptr) {
+            enqueueFifoPut(srcDataOff, dstDataOff, bytes, worldPeer,
+                           src.getMrIndex(), dst.getMrIndex());
+            if (fifoBuffer != nullptr)
+              fifoFlush(fifoBuffer);
+            Atomic::fetchAdd(
+                reinterpret_cast<unsigned int *>(
+                    &peerSignal[_contextId * signalCount +
+                                (int)getSignalIdx(ra)]),
+                static_cast<unsigned int>(getSignalValue(ra)),
+                flagcxDeviceMemoryOrderRelease);
+          } else {
+            enqueueFifoPutSignal(srcDataOff, dstDataOff, bytes,
+                                 getSignalIdx(ra),
+                                 (uint32_t)getSignalValue(ra), worldPeer,
+                                 src.getMrIndex(), dst.getMrIndex());
+          }
         } else {
           enqueueFifoPut(srcDataOff, dstDataOff, bytes, worldPeer,
                          src.getMrIndex(), dst.getMrIndex());
@@ -894,7 +917,25 @@ struct CommTraits<DefaultBackend<PlatformTag>> {
                             dst.getMrIndex());
         if (isSignal(ra)) {
           validateCompletionValue(getSignalValue(ra));
-          enqueueFifoSignalAction(ra, worldPeer, 0);
+          // Order the signal after the scalar write and deliver it from this
+          // kernel: every inter peer increments the same word, which a
+          // host-side read/add/write cannot do without losing an update.
+          uint64_t *peerSignal =
+              (worldPeer >= 0 && worldPeer < _dc.getSize())
+                  ? _dc.getProxySignalPeerPtr(worldPeer)
+                  : nullptr;
+          if (peerSignal != nullptr) {
+            if (fifoBuffer != nullptr)
+              fifoFlush(fifoBuffer);
+            Atomic::fetchAdd(
+                reinterpret_cast<unsigned int *>(
+                    &peerSignal[_contextId * signalCount +
+                                (int)getSignalIdx(ra)]),
+                static_cast<unsigned int>(getSignalValue(ra)),
+                flagcxDeviceMemoryOrderRelease);
+          } else {
+            enqueueFifoSignalAction(ra, worldPeer, 0);
+          }
         }
       }
       coop.sync();
