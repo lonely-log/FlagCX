@@ -175,6 +175,15 @@ flagcxResult_t flagcxSymWindowEnsureNetworkMr(flagcxHeteroComm_t comm,
   // still release (or retain for retry) the acquired MR reference.
   window->mrIndex = mrIndex;
   window->hasNetworkMrRef = true;
+  {
+    struct flagcxOneSideHandleInfo *h = comm->oneSideHandles[mrIndex];
+    fprintf(stderr,
+            "[SYM] rank=%d localBase=%p heapSize=%zu baseVas=%p regionSize=%zu\n",
+            comm->rank, (void *)window->localBase, (size_t)window->heapSize,
+            h ? (void *)h->baseVas[comm->rank] : 0,
+            h ? (size_t)h->regionSizes[comm->rank] : 0);
+    fflush(stderr);
+  }
   if (!flagcxSymWindowHasValidNetworkMr(comm, window))
     return flagcxInternalError;
   window->mrBase = comm->oneSideHandles[mrIndex]->baseVas[comm->rank];

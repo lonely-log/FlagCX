@@ -1461,7 +1461,7 @@ flagcxResult_t flagcxOneSideRegisterInternal(flagcxHeteroComm_t heteroComm,
       flagcxOneSideConvergeStatus(heteroComm->bootstrap, heteroComm->rank,
                                   heteroComm->nRanks, lookupResult);
   if (lookupResult != flagcxSuccess)
-    return lookupResult;
+    { fprintf(stderr,"[OSR] lookupResult=%d\n",(int)lookupResult); fflush(stderr); return lookupResult; }
   // Encode index+1 so ranks agree on both reuse-vs-create and the public MR
   // index. Agreeing only on a boolean could silently pair different slots
   // after asymmetric cleanup histories.
@@ -1473,14 +1473,14 @@ flagcxResult_t flagcxOneSideRegisterInternal(flagcxHeteroComm_t heteroComm,
                                   heteroComm->nRanks, allocationResult);
   if (allocationResult != flagcxSuccess) {
     free(reuseDecisions);
-    return allocationResult;
+    { fprintf(stderr,"[OSR] allocationResult=%d\n",(int)allocationResult); fflush(stderr); return allocationResult; }
   }
   reuseDecisions[heteroComm->rank] = existingIndex + 1;
   flagcxResult_t gatherResult = bootstrapCollAllGather(
       heteroComm->bootstrap, reuseDecisions, sizeof(int));
   if (gatherResult != flagcxSuccess) {
     free(reuseDecisions);
-    return gatherResult;
+    { fprintf(stderr,"[OSR] gatherResult=%d\n",(int)gatherResult); fflush(stderr); return gatherResult; }
   }
   for (int peer = 1; peer < heteroComm->nRanks; peer++) {
     if (reuseDecisions[peer] != reuseDecisions[0]) {
@@ -1500,7 +1500,7 @@ flagcxResult_t flagcxOneSideRegisterInternal(flagcxHeteroComm_t heteroComm,
           heteroComm->bootstrap, heteroComm->rank, heteroComm->nRanks,
           h->windowRefs == UINT32_MAX ? flagcxSystemError : flagcxSuccess);
       if (refResult != flagcxSuccess)
-        return refResult;
+        { fprintf(stderr,"[OSR] refResult=%d\n",(int)refResult); fflush(stderr); return refResult; }
       h->windowRefs++;
     } else {
       h->commOwned = 1;
@@ -1517,7 +1517,7 @@ flagcxResult_t flagcxOneSideRegisterInternal(flagcxHeteroComm_t heteroComm,
       flagcxOneSideConvergeStatus(heteroComm->bootstrap, heteroComm->rank,
                                   heteroComm->nRanks, pendingResult);
   if (pendingResult != flagcxSuccess)
-    return pendingResult;
+    { fprintf(stderr,"[OSR] pendingResult=%d\n",(int)pendingResult); fflush(stderr); return pendingResult; }
 
   flagcxResult_t res = flagcxSuccess;
   void *mrHandle = NULL;
@@ -1531,7 +1531,7 @@ flagcxResult_t flagcxOneSideRegisterInternal(flagcxHeteroComm_t heteroComm,
   int publishSlot = -1;
   res = flagcxOneSideChoosePublishSlot(heteroComm, &publishSlot);
   if (res != flagcxSuccess)
-    return res;
+    { fprintf(stderr,"[OSR] res@%d=%d\n", __LINE__, (int)res); fflush(stderr); return res; }
 
   // Prepare a replacement array locally, but do not attach it until the
   // collective transaction succeeds on every rank.
@@ -1558,7 +1558,7 @@ flagcxResult_t flagcxOneSideRegisterInternal(flagcxHeteroComm_t heteroComm,
   if (res != flagcxSuccess) {
     if (replaceHandleArray)
       free(publishHandles);
-    return res;
+    { fprintf(stderr,"[OSR] res@%d=%d\n", __LINE__, (int)res); fflush(stderr); return res; }
   }
 
   bool isFirstHandle = (publishSlot == 0);
@@ -1621,7 +1621,7 @@ flagcxResult_t flagcxOneSideRegisterInternal(flagcxHeteroComm_t heteroComm,
   res = flagcxOneSideConvergeStatus(heteroComm->bootstrap, heteroComm->rank,
                                     heteroComm->nRanks, res);
   if (res != flagcxSuccess)
-    goto fail_mr;
+    { fprintf(stderr,"[OSR] fail_mr@%d res=%d\n", __LINE__, (int)res); fflush(stderr); goto fail_mr; }
 
   // Allgather MR info
   {
@@ -1633,7 +1633,7 @@ flagcxResult_t flagcxOneSideRegisterInternal(flagcxHeteroComm_t heteroComm,
     res = flagcxOneSideConvergeStatus(heteroComm->bootstrap, heteroComm->rank,
                                       nranks, exchangeResult);
     if (res != flagcxSuccess)
-      goto fail_mr;
+      { fprintf(stderr,"[OSR] fail_mr@%d res=%d\n", __LINE__, (int)res); fflush(stderr); goto fail_mr; }
 
     int slot = publishSlot;
     if (replaceHandleArray) {
@@ -1696,7 +1696,7 @@ fail_info:
   free(info);
   if (replaceHandleArray)
     free(publishHandles);
-  return res;
+  { fprintf(stderr,"[OSR] res@%d=%d\n", __LINE__, (int)res); fflush(stderr); return res; }
 }
 
 flagcxResult_t flagcxOneSideRegister(flagcxComm_t comm, void *buff,

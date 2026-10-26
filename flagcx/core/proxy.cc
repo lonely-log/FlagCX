@@ -1356,7 +1356,10 @@ flagcxResult_t flagcxProxyInit(struct flagcxHeteroComm *comm) {
   comm->proxyState->kernelState.ready = 0;
   comm->proxyState->kernelState.terminalResult = flagcxSuccess;
 
-  int nKernelProxies = flagcxParamKernelProxyParallelism();
+
+  fprintf(stderr, "[S6W] proxyInit comm=%p nKernelProxies=%d\n", (void *)comm,
+          flagcxParamKernelProxyParallelism());
+  fflush(stderr);  int nKernelProxies = flagcxParamKernelProxyParallelism();
   if (nKernelProxies < 1)
     nKernelProxies = 1;
   if (nKernelProxies > FLAGCX_DEVICE_CTA_COUNT)
@@ -1616,6 +1619,9 @@ out:
   // observe.
   for (int i = 0; i < comm->proxyState->kernelState.contextCount; i++) {
     flagcxFifo_t fifo = comm->proxyState->kernelState.fifos[i];
+    // Publish the cleared slot BEFORE freeing, so a racing kernel-proxy
+    // worker observes nullptr instead of a dangling FIFO.
+    comm->proxyState->kernelState.fifos[i] = nullptr;
     if (fifo != nullptr) {
       fifo->flagcxFifoDestroy();
       delete fifo;
@@ -1925,6 +1931,19 @@ static flagcxResult_t flagcxKernelProxyPost(
   flagcxResult_t res = flagcxSuccess;
   {
     flagcxKernelSubmitScope submitScope(submit);
+    if (getenv("FLAGCX_KP_TRACE") != NULL) {
+      static int kpt_c = 0;
+      if (kpt_c++ < 600) {
+        fprintf(stderr,
+                "[KP] rank=%d type=%d peer=%d size=%zu srcOff=%llu dstOff=%llu "
+                "sMr=%d dMr=%d sigOff=%llu sigVal=%llu putVal=%llu ctx=%d\n",
+                comm->rank, type, peer, size, (unsigned long long)srcOff,
+                (unsigned long long)dstOff, srcMrIdx, dstMrIdx,
+                (unsigned long long)signalOff, (unsigned long long)signalValue,
+                (unsigned long long)putValue, contextId);
+        fflush(stderr);
+      }
+    }
     switch (type) {
       case FLAGCX_RMA_PUT:
         res = net->iput == NULL
@@ -2089,6 +2108,24 @@ flagcxKernelProxySubmitFlags(struct flagcxDeviceTrigger *trigger) {
   }
 }
 
+
+#if defined(COMPILE_KERNEL_HOST) && defined(USE_ILUVATAR_ADAPTOR)
+extern "C" int flagcxSockDevTransfer(void *dst, const void *src, size_t size,
+                                     int copyType, void *signalPtr,
+                                     unsigned long long signalValue);
+static int flagcxDevSockRead(void *dstHost, const void *srcDev, size_t bytes) {
+  return flagcxSockDevTransfer(dstHost, srcDev, bytes, 1, NULL, 0);
+}
+#else
+static int flagcxDevSockRead(void *, const void *, size_t) { return -1; }
+#endif
+
+static int s6cnt(void) {
+  FILE *f = popen("dmesg 2>/dev/null | grep -c 'is not supported'", "r");
+  int v = -1;
+  if (f) { if (fscanf(f, "%d", &v) != 1) v = -1; pclose(f); }
+  return v;
+}
 void *flagcxProxyKernelService(void *args) {
   int groupCount = 0;
   int termCount = 0;
@@ -2099,6 +2136,9 @@ void *flagcxProxyKernelService(void *args) {
   flagcxProxyKernelServiceArg *arg = (flagcxProxyKernelServiceArg *)args;
   struct flagcxHeteroComm *comm = arg->comm;
   int contextId = arg->contextId;
+  fprintf(stderr, "[S6W] worker_start comm=%p ctx=%d tid=%lu\n", (void *)comm,
+          contextId, (unsigned long)pthread_self());
+  fflush(stderr);
   delete arg;
   flagcxResult_t res = flagcxSuccess;
   flagcxResult_t existingTerminal = flagcxSuccess;
@@ -2113,6 +2153,7 @@ void *flagcxProxyKernelService(void *args) {
   // Set device context
   FLAGCXCHECKGOTO(deviceAdaptor->setDevice(comm->cudaDev), res, out);
 
+  fprintf(stderr,"[S6CNT] worker_entry=%d\n",s6cnt()); fflush(stderr);
   // Create FIFO for this thread
   comm->proxyState->kernelState.fifos[contextId] = new flagcxFifo();
   FLAGCXCHECKGOTO(
@@ -2124,6 +2165,15 @@ void *flagcxProxyKernelService(void *args) {
           &comm->fifoBuffers[contextId],
           (void *)comm->proxyState->kernelState.fifos[contextId]->buffer),
       res, out);
+  {
+    int _pt = -1;
+    int _pr = deviceAdaptor->getPointerType(fifo->buffer, &_pt);
+    fprintf(stderr,
+            "[S6DIAG] ctx=%d fifo=%p buffer=%p ptrType=%d rc=%d fifoBufs=%p\n",
+            contextId, (void *)fifo, (void *)fifo->buffer, _pt, (int)_pr,
+            (void *)comm->fifoBuffers[contextId]);
+    fflush(stderr);
+  }
   existingTerminal = __atomic_load_n(
       &comm->proxyState->kernelState.terminalResult, __ATOMIC_ACQUIRE);
   if (existingTerminal != flagcxSuccess)
@@ -2186,6 +2236,55 @@ init_done:
     }
 
     if (!hasPending) {
+      if (getenv("FLAGCX_S6CNT") != NULL) {
+        fprintf(stderr, "[S6CNT] before_dequeue=%d\n", s6cnt());
+        fflush(stderr);
+      }
+      if (getenv("FLAGCX_FIFODUMP") != NULL) {
+        static time_t lastDump = 0;
+        time_t nowDump = time(NULL);
+        if (nowDump - lastDump >= 3) {
+          lastDump = nowDump;
+          uint64_t ctl[8] = {0};
+          flagcxDevSockRead(ctl, fifo->buffer, sizeof(ctl));
+          flagcxDevComm_t dumpDc = comm->devCommHandle;
+          uint64_t sig[360] = {0};
+          uint64_t sha[360] = {0};
+          if (dumpDc != NULL && dumpDc->signalBuffer != NULL &&
+              dumpDc->shadowBuffer != NULL && dumpDc->signalCount > 0) {
+            size_t slots = (size_t)dumpDc->signalCount * 4;
+            if (slots > 360)
+              slots = 360;
+            flagcxDevSockRead(sig, (char *)dumpDc->signalBuffer,
+                              slots * sizeof(uint64_t));
+            flagcxDevSockRead(sha, (char *)dumpDc->shadowBuffer,
+                              slots * sizeof(uint64_t));
+            fprintf(stderr, "[WDOG] t=%ld rank=%d ctx=%d cap=%u cons=%u "
+                            "prod=%u comp=%u term=%u pstate=%u inflight=%u |",
+                    (long)nowDump, comm->rank, contextId,
+                    (unsigned)(uint32_t)ctl[0], (unsigned)(uint32_t)ctl[1],
+                    (unsigned)(uint32_t)ctl[2], (unsigned)(uint32_t)ctl[3],
+                    (unsigned)(uint32_t)ctl[4], (unsigned)(uint32_t)ctl[5],
+                    kproxyState->transport.nativeInflight);
+            for (size_t s = 0; s < slots; ++s)
+              if (sig[s] != 0 || sha[s] != 0)
+                fprintf(stderr, " s%zu=%llu/%llu", s,
+                        (unsigned long long)sig[s],
+                        (unsigned long long)sha[s]);
+            fprintf(stderr, "\n");
+          }
+          fflush(stderr);
+        }
+      }
+      if (fifo == nullptr ||
+          fifo != comm->proxyState->kernelState.fifos[contextId] ||
+          fifo->buffer == nullptr) {
+        fprintf(stderr, "[S6FIX] ctx=%d fifo invalidated, worker exits\n",
+                contextId);
+        fflush(stderr);
+        res = flagcxInternalError;
+        break;
+      }
       res = dequeue(fifo->buffer, ptr);
       if (res == flagcxInProgress) {
         sched_yield();
@@ -2637,6 +2736,8 @@ flagcxResult_t flagcxProxyStop(struct flagcxHeteroComm *comm) {
 }
 
 flagcxResult_t flagcxProxyDestroy(struct flagcxHeteroComm *comm) {
+  fprintf(stderr, "[S6W] proxyDestroy comm=%p\n", (void *)comm);
+  fflush(stderr);
   flagcxResult_t result = flagcxSuccess;
   if (comm->proxyState->initialized == 1) {
     // Join service thread

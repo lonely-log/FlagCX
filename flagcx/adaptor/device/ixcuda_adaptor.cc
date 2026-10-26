@@ -63,6 +63,8 @@ flagcxResult_t ixcudaAdaptorDeviceMalloc(void **ptr, size_t size,
 flagcxResult_t ixcudaAdaptorDeviceFree(void *ptr, flagcxMemType_t type,
                                        flagcxStream_t stream) {
   if (type == flagcxMemHost) {
+    fprintf(stderr, "[S6HOSTFREE] pid=%d ptr=%p\n", (int)getpid(), ptr);
+    fflush(stderr);
     DEVCHECK(cudaFreeHost(ptr));
   } else if (type == flagcxMemManaged) {
     DEVCHECK(cudaFree(ptr));
@@ -390,11 +392,20 @@ flagcxResult_t ixcudaAdaptorEventElapsedTime(float *, flagcxEvent_t,
   return flagcxNotSupported;
 }
 
-flagcxResult_t ixcudaAdaptorHostRegister(void *, size_t) {
-  return flagcxNotSupported;
+flagcxResult_t ixcudaAdaptorHostRegister(void *ptr, size_t size) {
+  if (ptr == NULL || size == 0) {
+    return flagcxInvalidArgument;
+  }
+  DEVCHECK(cudaHostRegister(ptr, size,
+                            cudaHostRegisterPortable | cudaHostRegisterMapped));
+  return flagcxSuccess;
 }
-flagcxResult_t ixcudaAdaptorHostUnregister(void *) {
-  return flagcxNotSupported;
+flagcxResult_t ixcudaAdaptorHostUnregister(void *ptr) {
+  if (ptr == NULL) {
+    return flagcxInvalidArgument;
+  }
+  DEVCHECK(cudaHostUnregister(ptr));
+  return flagcxSuccess;
 }
 
 // Symmetric memory VMM stubs (not supported)

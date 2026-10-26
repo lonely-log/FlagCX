@@ -131,6 +131,11 @@ flagcxResult_t flagcxFifo::flagcxFifoInit() {
   buffer[flagcxFifoIdxCompleted] = 0; // IB completion count (GPU polls this)
   buffer[flagcxFifoIdxTerminalStatus] = flagcxSuccess;
   buffer[flagcxFifoIdxProducerState] = 0;
+  {
+    fprintf(stderr, "[S6ALLOC] pid=%d buffer=%p\n", (int)getpid(),
+            (void *)buffer);
+    fflush(stderr);
+  }
   memset((void *)(buffer + flagcxFifoIdxData), 0,
          flagcxKernelFifoCapacity * sizeof(flagcxDeviceTrigger));
   return flagcxSuccess;
@@ -138,6 +143,8 @@ flagcxResult_t flagcxFifo::flagcxFifoInit() {
 
 flagcxResult_t flagcxFifo::flagcxFifoDestroy() {
   INFO(FLAGCX_KERNEL, "flagcxFifoDestroy called");
+  fprintf(stderr, "[S6FREE] pid=%d buffer=%p\n", (int)getpid(), (void *)buffer);
+  fflush(stderr);
   FLAGCXCHECK(deviceAdaptor->deviceFree((void *)buffer, flagcxMemHost, NULL));
   return flagcxSuccess;
 }
