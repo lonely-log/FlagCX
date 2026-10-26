@@ -10,12 +10,16 @@
 #include "net.h"
 #include "net_transport.h"
 #include "param.h"
+#include "onesided.h"
 #include "socket.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 static int flagcxNetIfs = -1;
 struct flagcxNetSocketDev {
@@ -119,6 +123,9 @@ flagcxResult_t flagcxNetSocketGetProperties(int dev, void *props) {
 #define MAX_THREADS 16
 #define MAX_REQUESTS FLAGCX_NET_MAX_REQUESTS
 #define MIN_CHUNKSIZE (64 * 1024)
+
+// Op code carried by the stateless token that reports one-sided completion.
+#define FLAGCX_SOCK_OP_ONESHOT 0x5a5a
 
 FLAGCX_PARAM(SocketNsocksPerThread, "NSOCKS_PERTHREAD", -2);
 FLAGCX_PARAM(SocketNthreads, "SOCKET_NTHREADS", -2);
@@ -527,6 +534,13 @@ flagcxResult_t flagcxNetSocketTest(void *request, int *done, int *size) {
     WARN("NET/Socket : test called with NULL request");
     return flagcxInternalError;
   }
+  if (r->op == FLAGCX_SOCK_OP_ONESHOT) {
+    // One-sided work completes before iput/iputSignal return.
+    if (size != NULL)
+      *size = r->size;
+    *done = 1;
+    return flagcxSuccess;
+  }
   if (r->used == 1) { /* try to send/recv size */
     int data = r->size;
     int offset = 0;
@@ -606,13 +620,484 @@ flagcxResult_t flagcxNetSocketTest(void *request, int *done, int *size) {
   return flagcxSuccess;
 }
 
+/* ==========================================================================
+ * One-sided support for the socket transport.
+ *
+ * The socket transport has no remote memory keys, so an inter-node peer's
+ * registered region is reached through an IPC mapping instead: the owner
+ * exports a vendor IPC handle to /dev/shm and a peer imports it once, caching
+ * the resulting mapping. Data movement and remote signal updates run through
+ * flagcxSockDevTransfer() so they can make progress while the application
+ * kernel is spinning in waitSignal.
+ * ========================================================================== */
+
+#define FLAGCX_SOCK_MR_MAGIC 0x524d4b53u /* "SKMR" */
+
+struct flagcxSockMrFile {
+  uint32_t magic;
+  uint32_t key;
+  int32_t pid;
+  uint32_t handleSize;
+  uint64_t addr;
+  uint64_t size;
+  uint64_t allocSize;
+  uint64_t userOffset;
+  uint8_t handle[FLAGCX_IPC_HANDLE_SIZE];
+};
+
+struct flagcxSockMr {
+  uintptr_t addr;
+  size_t size;
+  uint32_t key;
+  int isHost;
+  int hasIpc;
+  size_t allocSize;
+  size_t userOffset;
+  size_t handleSize;
+  flagcxIpcHandleData handleData;
+  struct flagcxSockMr *next;
+};
+
+static struct flagcxSockMr *g_sockMrs = NULL;
+static pthread_mutex_t g_sockMrLock = PTHREAD_MUTEX_INITIALIZER;
+
+struct flagcxSockPeerMr {
+  uint32_t key;
+  void *base;
+  size_t allocSize;
+  size_t userOffset;
+  uint64_t ownerVa;
+  int ownerPid;
+  struct flagcxSockPeerMr *next;
+};
+
+static struct flagcxSockPeerMr *g_sockPeerMrs = NULL;
+static pthread_mutex_t g_sockPeerMrLock = PTHREAD_MUTEX_INITIALIZER;
+
+// Stateless completion token: one-sided work is finished before it returns, so
+// every caller may share one token. `op` is the discriminator flagcxNetSocketTest
+// keys on, so it must be set before the token is handed out -- a zeroed request
+// would silently report "not done" and stall the FIFO completion counter.
+static struct flagcxNetSocketRequest g_sockOneShotRequest;
+
+static void *flagcxNetSocketOneShotToken(void) {
+  g_sockOneShotRequest.op = FLAGCX_SOCK_OP_ONESHOT;
+  g_sockOneShotRequest.used = 0;
+  return (void *)&g_sockOneShotRequest;
+}
+
+#if defined(COMPILE_KERNEL_HOST) && defined(USE_ILUVATAR_ADAPTOR)
+extern "C" int flagcxSockDevTransfer(void *dst, const void *src, size_t size,
+                                     int copyType, void *signalPtr,
+                                     unsigned long long signalValue);
+extern "C" int flagcxSockDevMemRange(void *ptr, void **base, size_t *size);
+#define FLAGCX_SOCK_HAS_DEV_TRANSFER 1
+#endif
+
+// Resolve the allocation that backs `buff` so the exported IPC handle and the
+// user offset are consistent: cudaIpcOpenMemHandle always yields the
+// allocation base, never a mid-allocation address.
+static flagcxResult_t flagcxNetSocketExportRange(const void *buff, size_t size,
+                                                 void **exportBase,
+                                                 size_t *allocSize,
+                                                 size_t *userOffset) {
+#ifdef FLAGCX_SOCK_HAS_DEV_TRANSFER
+  void *rangeBase = NULL;
+  size_t rangeSize = 0;
+  if (flagcxSockDevMemRange(const_cast<void *>(buff), &rangeBase,
+                            &rangeSize) == 0 &&
+      rangeBase != NULL && rangeSize >= size) {
+    uintptr_t base = (uintptr_t)rangeBase;
+    uintptr_t user = (uintptr_t)buff;
+    if (user >= base && user - base <= rangeSize &&
+        size <= rangeSize - (user - base)) {
+      *exportBase = rangeBase;
+      *allocSize = rangeSize;
+      *userOffset = user - base;
+      return flagcxSuccess;
+    }
+  }
+#endif
+  return flagcxGetIpcExportRange(buff, size, exportBase, allocSize,
+                                 userOffset);
+}
+
+// Diagnostics only: read device memory on the transfer stream, which is the
+// only stream that can make progress while a kernel spins in waitSignal.
+static int flagcxNetSocketDevRead(void *dstHost, const void *srcDev,
+                                  size_t bytes) {
+#ifdef FLAGCX_SOCK_HAS_DEV_TRANSFER
+  return flagcxSockDevTransfer(dstHost, srcDev, bytes, 1, NULL, 0);
+#else
+  (void)dstHost; (void)srcDev; (void)bytes;
+  return -1;
+#endif
+}
+
+static void flagcxNetSocketMrPath(uint32_t key, char *buf, size_t len) {
+  snprintf(buf, len, "/dev/shm/flagcx-sockmr-%08x", (unsigned)key);
+}
+
+static void flagcxNetSocketMrPublish(const struct flagcxSockMr *mr) {
+  if (mr == NULL || !mr->hasIpc || mr->handleSize == 0)
+    return;
+  char finalPath[64];
+  char tmpPath[80];
+  flagcxNetSocketMrPath(mr->key, finalPath, sizeof(finalPath));
+  snprintf(tmpPath, sizeof(tmpPath), "%s.tmp%d", finalPath, (int)getpid());
+
+  struct flagcxSockMrFile rec;
+  memset(&rec, 0, sizeof(rec));
+  rec.magic = FLAGCX_SOCK_MR_MAGIC;
+  rec.key = mr->key;
+  rec.pid = (int32_t)getpid();
+  rec.handleSize = (uint32_t)mr->handleSize;
+  rec.addr = (uint64_t)mr->addr;
+  rec.size = (uint64_t)mr->size;
+  rec.allocSize = (uint64_t)mr->allocSize;
+  rec.userOffset = (uint64_t)mr->userOffset;
+  memcpy(rec.handle, &mr->handleData, mr->handleSize);
+
+  int fd = open(tmpPath, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+  if (fd < 0) {
+    WARN("NET/Socket : cannot publish MR key 0x%x (%s)", (unsigned)mr->key,
+         strerror(errno));
+    return;
+  }
+  ssize_t written = write(fd, &rec, sizeof(rec));
+  close(fd);
+  if (written != (ssize_t)sizeof(rec) || rename(tmpPath, finalPath) != 0) {
+    WARN("NET/Socket : cannot publish MR key 0x%x", (unsigned)mr->key);
+    unlink(tmpPath);
+    return;
+  }
+  INFO(FLAGCX_NET, "NET/Socket : published MR key 0x%x addr=0x%lx size=%zu",
+       (unsigned)mr->key, (unsigned long)mr->addr, mr->size);
+}
+
+static void flagcxNetSocketMrUnpublish(uint32_t key) {
+  char path[64];
+  flagcxNetSocketMrPath(key, path, sizeof(path));
+  unlink(path);
+}
+
+// Owner identity published with a key (trace only).
+static void flagcxNetSocketMrOwner(uint32_t key, uint64_t *ownerVa, int *pid);
+
+static flagcxResult_t flagcxNetSocketMrImport(uint32_t key, void **baseOut,
+                                              size_t *allocOut,
+                                              size_t *offOut) {
+  if (key == 0 || baseOut == NULL)
+    return flagcxInvalidArgument;
+  pthread_mutex_lock(&g_sockPeerMrLock);
+  for (struct flagcxSockPeerMr *it = g_sockPeerMrs; it != NULL; it = it->next) {
+    if (it->key == key) {
+      *baseOut = it->base;
+      if (allocOut != NULL)
+        *allocOut = it->allocSize;
+      if (offOut != NULL)
+        *offOut = it->userOffset;
+      pthread_mutex_unlock(&g_sockPeerMrLock);
+      return flagcxSuccess;
+    }
+  }
+
+  char path[64];
+  flagcxNetSocketMrPath(key, path, sizeof(path));
+  struct flagcxSockMrFile rec;
+  memset(&rec, 0, sizeof(rec));
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    pthread_mutex_unlock(&g_sockPeerMrLock);
+    WARN("NET/Socket : MR key 0x%x is not published on this host",
+         (unsigned)key);
+    return flagcxInternalError;
+  }
+  ssize_t got = read(fd, &rec, sizeof(rec));
+  close(fd);
+  if (got != (ssize_t)sizeof(rec) || rec.magic != FLAGCX_SOCK_MR_MAGIC ||
+      rec.key != key || rec.handleSize == 0 ||
+      rec.handleSize > sizeof(rec.handle)) {
+    pthread_mutex_unlock(&g_sockPeerMrLock);
+    WARN("NET/Socket : MR key 0x%x has a malformed descriptor",
+         (unsigned)key);
+    return flagcxInternalError;
+  }
+  if (deviceAdaptor == NULL || deviceAdaptor->ipcMemHandleOpen == NULL) {
+    pthread_mutex_unlock(&g_sockPeerMrLock);
+    return flagcxNotSupported;
+  }
+
+  flagcxIpcMemHandle_t handle = (flagcxIpcMemHandle_t)&rec.handle[0];
+  void *peerBase = NULL;
+  flagcxResult_t res = deviceAdaptor->ipcMemHandleOpen(handle, &peerBase);
+  if (res != flagcxSuccess || peerBase == NULL) {
+    pthread_mutex_unlock(&g_sockPeerMrLock);
+    WARN("NET/Socket : cannot open the IPC handle for MR key 0x%x (%d)",
+         (unsigned)key, (int)res);
+    return res == flagcxSuccess ? flagcxSystemError : res;
+  }
+
+  struct flagcxSockPeerMr *entry =
+      (struct flagcxSockPeerMr *)calloc(1, sizeof(*entry));
+  if (entry == NULL) {
+    pthread_mutex_unlock(&g_sockPeerMrLock);
+    if (deviceAdaptor->ipcMemHandleClose != NULL)
+      deviceAdaptor->ipcMemHandleClose(peerBase);
+    return flagcxSystemError;
+  }
+  entry->key = key;
+  entry->base = peerBase;
+  entry->allocSize = (size_t)rec.allocSize;
+  entry->userOffset = (size_t)rec.userOffset;
+  entry->ownerVa = (uint64_t)rec.addr;
+  entry->ownerPid = (int)rec.pid;
+  entry->next = g_sockPeerMrs;
+  g_sockPeerMrs = entry;
+
+  *baseOut = entry->base;
+  if (allocOut != NULL)
+    *allocOut = entry->allocSize;
+  if (offOut != NULL)
+    *offOut = entry->userOffset;
+  pthread_mutex_unlock(&g_sockPeerMrLock);
+  INFO(FLAGCX_NET, "NET/Socket : imported MR key 0x%x base=%p offset=%zu",
+       (unsigned)key, peerBase, entry->userOffset);
+  return flagcxSuccess;
+}
+
+static void flagcxNetSocketMrOwner(uint32_t key, uint64_t *ownerVa, int *pid) {
+  if (ownerVa != NULL)
+    *ownerVa = 0;
+  if (pid != NULL)
+    *pid = -1;
+  pthread_mutex_lock(&g_sockPeerMrLock);
+  for (struct flagcxSockPeerMr *it = g_sockPeerMrs; it != NULL; it = it->next) {
+    if (it->key == key) {
+      if (ownerVa != NULL)
+        *ownerVa = it->ownerVa;
+      if (pid != NULL)
+        *pid = it->ownerPid;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&g_sockPeerMrLock);
+}
+
+// Address of a peer rank's registered region inside this process.
+// Import a peer mapping and verify it is the region we think it is.
+static flagcxResult_t
+flagcxNetSocketImportChecked(const struct flagcxOneSideHandleInfo *info,
+                             int rank, void **baseOut) {
+  uint32_t key = info->mrInfos[rank].rkeys[0];
+  void *base = NULL;
+  size_t allocSize = 0;
+  size_t userOffset = 0;
+  FLAGCXCHECK(flagcxNetSocketMrImport(key, &base, &allocSize, &userOffset));
+  static int checked = 0;
+  if (getenv("FLAGCX_MRCHK") != NULL && checked < 64) {
+    checked++;
+    uint64_t ownerVa = 0;
+    int pid = -1;
+    flagcxNetSocketMrOwner(key, &ownerVa, &pid);
+    fprintf(stderr,
+            "[MRCHK] pid=%d rank=%d key=0x%x ownerPid=%d ownerVa=0x%llx "
+            "expectedVa=0x%lx %s\n",
+            (int)getpid(), rank, (unsigned)key, pid,
+            (unsigned long long)ownerVa,
+            (unsigned long)info->baseVas[rank],
+            (ownerVa == (uint64_t)info->baseVas[rank]) ? "MATCH" : "MISMATCH");
+    fflush(stderr);
+  }
+  if (userOffset > allocSize)
+    return flagcxInternalError;
+  *baseOut = (void *)((uintptr_t)base + (uintptr_t)userOffset);
+  return flagcxSuccess;
+}
+
+static flagcxResult_t
+flagcxNetSocketPeerRegion(const struct flagcxOneSideHandleInfo *info, int rank,
+                          uint64_t offset, size_t size, void **out) {
+  if (info == NULL || info->baseVas == NULL || info->regionSizes == NULL ||
+      info->mrInfos == NULL || out == NULL || rank < 0 || rank >= info->nRanks)
+    return flagcxInvalidArgument;
+  if (offset > info->regionSizes[rank] ||
+      size > info->regionSizes[rank] - offset)
+    return flagcxInvalidArgument;
+  void *region = NULL;
+  FLAGCXCHECK(flagcxNetSocketImportChecked(info, rank, &region));
+  *out = (void *)((uintptr_t)region + (uintptr_t)offset);
+  return flagcxSuccess;
+}
+
+// Address of this rank's own registered region.
+static flagcxResult_t
+flagcxNetSocketLocalRegion(const struct flagcxOneSideHandleInfo *info, int rank,
+                           uint64_t offset, size_t size, void **out,
+                           int *isHost) {
+  if (info == NULL || info->baseVas == NULL || info->regionSizes == NULL ||
+      out == NULL || rank < 0 || rank >= info->nRanks)
+    return flagcxInvalidArgument;
+  if (offset > info->regionSizes[rank] ||
+      size > info->regionSizes[rank] - offset)
+    return flagcxInvalidArgument;
+  *out = (void *)(info->baseVas[rank] + (uintptr_t)offset);
+  if (isHost != NULL) {
+    struct flagcxSockMr *mr = (struct flagcxSockMr *)info->localMrHandle;
+    *isHost = (mr != NULL && mr->addr != 0 && mr->isHost) ? 1 : 0;
+  }
+  return flagcxSuccess;
+}
+
+// copyType is a flagcxMemcpyType_t. size == 0 performs only the signal add.
+static flagcxResult_t flagcxNetSocketTransfer(void *dst, const void *src,
+                                              size_t size, int copyType,
+                                              void *signalPtr,
+                                              uint64_t signalValue) {
+  if (dst == NULL && signalPtr == NULL)
+    return flagcxInvalidArgument;
+#ifdef FLAGCX_SOCK_HAS_DEV_TRANSFER
+  int rc = flagcxSockDevTransfer(dst, src, size, copyType, signalPtr,
+                                 (unsigned long long)signalValue);
+  if (rc != 0) {
+    WARN("NET/Socket : peer transfer failed (%d)", rc);
+    return flagcxUnhandledDeviceError;
+  }
+  return flagcxSuccess;
+#else
+  (void)dst; (void)src; (void)size; (void)copyType; (void)signalPtr;
+  (void)signalValue;
+  return flagcxNotSupported;
+#endif
+}
+
+// RDMA READ emulation: pull the peer's region into a local buffer.
+flagcxResult_t flagcxNetSocketIget(void *sendComm, uint64_t srcOff,
+                                   uint64_t dstOff, size_t size, int srcRank,
+                                   int dstRank, void **srcHandles,
+                                   void **dstHandles, void **request) {
+  (void)sendComm;
+  if (request == NULL)
+    return flagcxInvalidArgument;
+  *request = NULL;
+  if (size == 0)
+    return flagcxInvalidArgument;
+
+  void *peerSrc = NULL;
+  void *localDst = NULL;
+  int isHostDst = 0;
+  FLAGCXCHECK(flagcxNetSocketPeerRegion(
+      (const struct flagcxOneSideHandleInfo *)srcHandles, srcRank, srcOff, size,
+      &peerSrc));
+  FLAGCXCHECK(flagcxNetSocketLocalRegion(
+      (const struct flagcxOneSideHandleInfo *)dstHandles, dstRank, dstOff, size,
+      &localDst, &isHostDst));
+  FLAGCXCHECK(flagcxNetSocketTransfer(
+      localDst, peerSrc, size,
+      isHostDst ? flagcxMemcpyDeviceToHost : flagcxMemcpyDeviceToDevice, NULL,
+      0));
+
+  if (getenv("FLAGCX_KP_TRACE") != NULL) {
+    static int ig_c = 0;
+    if (ig_c++ < 200) {
+      fprintf(stderr,
+              "[SOCKIGET] srcOff=%llu dstOff=%llu size=%zu srcRank=%d "
+              "dstRank=%d peerSrc=%p localDst=%p hostDst=%d\n",
+              (unsigned long long)srcOff, (unsigned long long)dstOff, size,
+              srcRank, dstRank, peerSrc, localDst, isHostDst);
+      fflush(stderr);
+    }
+  }
+  *request = flagcxNetSocketOneShotToken();
+  return flagcxSuccess;
+}
+
 flagcxResult_t flagcxNetSocketRegMr(void *comm, void *data, size_t size,
                                     int type, int mrFlags, void **mhandle) {
+  (void)comm;
   (void)mrFlags;
-  return (type != FLAGCX_PTR_HOST) ? flagcxInternalError : flagcxSuccess;
+  if (data == NULL || size == 0 || mhandle == NULL)
+    return flagcxInvalidArgument;
+  struct flagcxSockMr *mr =
+      (struct flagcxSockMr *)calloc(1, sizeof(struct flagcxSockMr));
+  if (mr == NULL)
+    return flagcxSystemError;
+  mr->addr = (uintptr_t)data;
+  mr->size = size;
+  mr->isHost = (type == FLAGCX_PTR_HOST) ? 1 : 0;
+  // Opaque, non-zero, per-process key: the one-sided layer all-gathers it and
+  // hands it back as the peer's rkey.
+  mr->key = (uint32_t)((((uint64_t)mr->addr >> 8) ^
+                        ((uint64_t)(uint32_t)getpid() << 12)) |
+                       1u);
+
+  // Export device memory so that a peer process on this host can reach it.
+  if (!mr->isHost && deviceAdaptor != NULL &&
+      deviceAdaptor->ipcMemHandleCreate != NULL &&
+      deviceAdaptor->ipcMemHandleGet != NULL) {
+    void *exportBase = NULL;
+    size_t allocSize = 0;
+    size_t userOffset = 0;
+    flagcxResult_t res = flagcxNetSocketExportRange(data, size, &exportBase,
+                                                   &allocSize, &userOffset);
+    if (res == flagcxSuccess) {
+      flagcxIpcMemHandle_t handle = NULL;
+      size_t handleSize = 0;
+      res = deviceAdaptor->ipcMemHandleCreate(&handle, &handleSize);
+      if (res == flagcxSuccess && handle != NULL && handleSize > 0 &&
+          handleSize <= sizeof(flagcxIpcHandleData)) {
+        res = deviceAdaptor->ipcMemHandleGet(handle, exportBase);
+        if (res == flagcxSuccess) {
+          res = flagcxStoreIpcHandle(&mr->handleData, (const void *)handle,
+                                     handleSize);
+          if (res == flagcxSuccess) {
+            mr->hasIpc = 1;
+            mr->allocSize = allocSize;
+            mr->userOffset = userOffset;
+            mr->handleSize = handleSize;
+          }
+        }
+      }
+      if (handle != NULL && deviceAdaptor->ipcMemHandleFree != NULL)
+        deviceAdaptor->ipcMemHandleFree(handle);
+    }
+    if (!mr->hasIpc)
+      INFO(FLAGCX_NET, "NET/Socket : no IPC export for buff=%p size=%zu", data,
+           size);
+  }
+
+  pthread_mutex_lock(&g_sockMrLock);
+  mr->next = g_sockMrs;
+  g_sockMrs = mr;
+  pthread_mutex_unlock(&g_sockMrLock);
+  *mhandle = (void *)mr;
+  flagcxNetSocketMrPublish(mr);
+
+  if (getenv("FLAGCX_KP_TRACE") != NULL) {
+    fprintf(stderr,
+            "[SOCKREG] pid=%d addr=0x%lx size=%zu type=%d key=0x%x ipc=%d "
+            "allocSize=%zu userOffset=%zu\\n",
+            (int)getpid(), (unsigned long)mr->addr, mr->size, type,
+            (unsigned)mr->key, mr->hasIpc, mr->allocSize, mr->userOffset);
+    fflush(stderr);
+  }
+  return flagcxSuccess;
 }
 
 flagcxResult_t flagcxNetSocketDeregMr(void *comm, void *mhandle) {
+  (void)comm;
+  struct flagcxSockMr *mr = (struct flagcxSockMr *)mhandle;
+  if (mr == NULL)
+    return flagcxSuccess;
+  flagcxNetSocketMrUnpublish(mr->key);
+  pthread_mutex_lock(&g_sockMrLock);
+  struct flagcxSockMr **link = &g_sockMrs;
+  while (*link != NULL && *link != mr)
+    link = &(*link)->next;
+  if (*link == mr)
+    *link = mr->next;
+  pthread_mutex_unlock(&g_sockMrLock);
+  free(mr);
   return flagcxSuccess;
 }
 
@@ -686,6 +1171,164 @@ flagcxResult_t flagcxNetSocketClose(void *opaqueComm) {
   return flagcxSuccess;
 }
 
+
+/* --- One-sided support: peers are reached through IPC mappings --- */
+flagcxResult_t flagcxNetSocketGetMrInfo(void *mhandle,
+                                        struct flagcxNetMrInfo *info) {
+  if (mhandle == NULL || info == NULL)
+    return flagcxInvalidArgument;
+  memset(info, 0, sizeof(*info));
+  struct flagcxSockMr *mr = (struct flagcxSockMr *)mhandle;
+  info->nKeys = 1;
+  info->lkeys[0] = mr->key;
+  info->rkeys[0] = mr->key;
+  return flagcxSuccess;
+}
+
+flagcxResult_t flagcxNetSocketIput(void *sendComm, uint64_t srcOff,
+                                   uint64_t dstOff, size_t size, int srcRank,
+                                   int dstRank, void **srcHandles,
+                                   void **dstHandles, void **request) {
+  (void)sendComm;
+  if (request == NULL)
+    return flagcxInvalidArgument;
+  *request = NULL;
+  if (size == 0)
+    return flagcxInvalidArgument;
+
+  void *srcPtr = NULL;
+  void *dstPtr = NULL;
+  int isHostSrc = 0;
+  FLAGCXCHECK(flagcxNetSocketLocalRegion(
+      (const struct flagcxOneSideHandleInfo *)srcHandles, srcRank, srcOff, size,
+      &srcPtr, &isHostSrc));
+  FLAGCXCHECK(flagcxNetSocketPeerRegion(
+      (const struct flagcxOneSideHandleInfo *)dstHandles, dstRank, dstOff, size,
+      &dstPtr));
+  FLAGCXCHECK(flagcxNetSocketTransfer(
+      dstPtr, srcPtr, size,
+      isHostSrc ? flagcxMemcpyHostToDevice : flagcxMemcpyDeviceToDevice, NULL,
+      0));
+
+  if (getenv("FLAGCX_KP_TRACE") != NULL) {
+    static int ip_c = 0;
+    if (ip_c++ < 200) {
+      fprintf(stderr,
+              "[SOCKIPUT] srcOff=%llu dstOff=%llu size=%zu srcRank=%d "
+              "dstRank=%d src=%p dst=%p hostSrc=%d\n",
+              (unsigned long long)srcOff, (unsigned long long)dstOff, size,
+              srcRank, dstRank, srcPtr, dstPtr, isHostSrc);
+      fflush(stderr);
+    }
+  }
+  *request = flagcxNetSocketOneShotToken();
+  return flagcxSuccess;
+}
+
+flagcxResult_t flagcxNetSocketIputSignal(void *sendComm, uint64_t srcOff,
+                                         uint64_t dstOff, size_t size,
+                                         int srcRank, int dstRank,
+                                         void **srcHandles, void **dstHandles,
+                                         uint64_t signalOff,
+                                         void **signalHandles,
+                                         uint64_t signalValue,
+                                         void **request) {
+  (void)sendComm;
+  if (request == NULL)
+    return flagcxInvalidArgument;
+  *request = NULL;
+
+  void *srcPtr = NULL;
+  void *dstPtr = NULL;
+  int isHostSrc = 0;
+  if (size > 0) {
+    FLAGCXCHECK(flagcxNetSocketLocalRegion(
+        (const struct flagcxOneSideHandleInfo *)srcHandles, srcRank, srcOff,
+        size, &srcPtr, &isHostSrc));
+    FLAGCXCHECK(flagcxNetSocketPeerRegion(
+        (const struct flagcxOneSideHandleInfo *)dstHandles, dstRank, dstOff,
+        size, &dstPtr));
+  }
+
+  void *signalPtr = NULL;
+  if (signalHandles != NULL) {
+    FLAGCXCHECK(flagcxNetSocketPeerRegion(
+        (const struct flagcxOneSideHandleInfo *)signalHandles, dstRank,
+        signalOff, sizeof(uint64_t), &signalPtr));
+  }
+  if (size == 0 && signalPtr == NULL)
+    return flagcxInvalidArgument;
+
+  if (getenv("FLAGCX_KP_TRACE") != NULL) {
+    static int pre_c = 0;
+    if (pre_c++ < 400) {
+      fprintf(stderr, "[SIGPRE] pid=%d dstRank=%d sigOff=%llu dst=%p sig=%p\n",
+              (int)getpid(), dstRank, (unsigned long long)signalOff, dstPtr,
+              signalPtr);
+      fflush(stderr);
+    }
+  }
+  FLAGCXCHECK(flagcxNetSocketTransfer(
+      dstPtr, srcPtr, size,
+      isHostSrc ? flagcxMemcpyHostToDevice : flagcxMemcpyDeviceToDevice,
+      signalPtr, signalValue));
+  if (getenv("FLAGCX_KP_TRACE") != NULL) {
+    static int post_c = 0;
+    if (post_c++ < 400) {
+      fprintf(stderr, "[SIGDONE] pid=%d dstRank=%d sigOff=%llu\n", (int)getpid(),
+              dstRank, (unsigned long long)signalOff);
+      fflush(stderr);
+    }
+  }
+
+  if (getenv("FLAGCX_KP_TRACE") != NULL) {
+    static int ips_c = 0;
+    if (ips_c++ < 200) {
+      fprintf(stderr,
+              "[SOCKIPUTSIG] srcOff=%llu dstOff=%llu size=%zu srcRank=%d "
+              "dstRank=%d sigOff=%llu sigVal=%llu dst=%p sigPtr=%p\n",
+              (unsigned long long)srcOff, (unsigned long long)dstOff, size,
+              srcRank, dstRank, (unsigned long long)signalOff,
+              (unsigned long long)signalValue, dstPtr, signalPtr);
+      fflush(stderr);
+    }
+  }
+  if (signalPtr != NULL && getenv("FLAGCX_SIGDUMP") != NULL) {
+    static int dumpN = 0;
+    if (dumpN++ < 24) {
+      unsigned long long peerWord = 0;
+      int prc = flagcxNetSocketDevRead(&peerWord, signalPtr, sizeof(peerWord));
+      fprintf(stderr, "[SIGDUMP] pid=%d dstRank=%d sigOff=%llu peerWord=%llu "
+                      "rc=%d\n",
+              (int)getpid(), dstRank, (unsigned long long)signalOff, peerWord,
+              prc);
+      struct flagcxSockMr *localMr = NULL;
+      if (signalHandles != NULL)
+        localMr = (struct flagcxSockMr *)((const struct
+                                          flagcxOneSideHandleInfo *)signalHandles)
+                      ->localMrHandle;
+      if (localMr != NULL && localMr->size > 0 && localMr->size <= 65536) {
+        unsigned long long *buf =
+            (unsigned long long *)malloc(localMr->size);
+        if (buf != NULL) {
+          int rc =
+              flagcxNetSocketDevRead(buf, (void *)localMr->addr, localMr->size);
+          fprintf(stderr, "[SIGDUMP] pid=%d localBase=%p size=%zu rc=%d nz:",
+                  (int)getpid(), (void *)localMr->addr, localMr->size, rc);
+          for (size_t w = 0; w * 8 + 8 <= localMr->size; w++)
+            if (buf[w] != 0)
+              fprintf(stderr, " [%zu]=%llu", w, buf[w]);
+          fprintf(stderr, "\n");
+          free(buf);
+        }
+      }
+      fflush(stderr);
+    }
+  }
+  *request = flagcxNetSocketOneShotToken();
+  return flagcxSuccess;
+}
+
 flagcxNetAdaptor flagcxNetSocket = {
     // Basic functions
     "Socket",
@@ -713,9 +1356,9 @@ flagcxNetAdaptor flagcxNetSocket = {
     flagcxNetSocketTest,
 
     // One-sided functions
-    NULL, // iput - not supported on socket
-    NULL, // iget - not supported on socket
-    NULL, // iputSignal - not supported on socket
+    flagcxNetSocketIput,
+    flagcxNetSocketIget,
+    flagcxNetSocketIputSignal,
 
     // Device name lookup
     NULL, // getDevFromName
@@ -724,7 +1367,7 @@ flagcxNetAdaptor flagcxNetSocket = {
     NULL, // iputBatch
     NULL, // testBatch
     NULL, // igetBatch
-    NULL, // getMrInfo
+    flagcxNetSocketGetMrInfo,
 
     // Latest-only VMM MR capabilities and internal metadata
     FLAGCX_VMM_MR_CAP_NONE,
