@@ -511,7 +511,21 @@ static flagcxResult_t flagcxConvergeIpcPrepareStatus(flagcxComm_t comm,
   return flagcxSuccess;
 }
 
+static int flagcxBuildIpcPeerPointersImpl(flagcxComm_t comm, void *buff,
+                                         size_t size, bool allRanks);
+
 int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size) {
+  return flagcxBuildIpcPeerPointersImpl(comm, buff, size, /*allRanks=*/false);
+}
+
+// World-rank indexed table. Only sound when every rank's allocation is
+// IPC-reachable from every other rank, i.e. a single-host deployment.
+int buildIpcPeerPointersAllRanks(flagcxComm_t comm, void *buff, size_t size) {
+  return flagcxBuildIpcPeerPointersImpl(comm, buff, size, /*allRanks=*/true);
+}
+
+static int flagcxBuildIpcPeerPointersImpl(flagcxComm_t comm, void *buff,
+                                         size_t size, bool allRanks) {
   int slot = -1;
   for (int k = 0; k < FLAGCX_MAX_IPC_ENTRIES; k++) {
     if (comm->ipcTable[k].hostPeerPtrs == nullptr &&
@@ -530,6 +544,11 @@ int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size) {
   int nRanks = comm->nranks;
   int localRanks = comm->localRanks;
   int *localRankToRank = comm->localRankToRank;
+  // Number of entries in the resulting table. World-rank indexing makes the
+  // table usable for peers outside this rank's local group.
+  const int peerCount = allRanks ? nRanks : localRanks;
+  if (peerCount <= 0 || peerCount > nRanks)
+    return -1;
 
   flagcxResult_t res = flagcxSuccess;
   struct flagcxIpcPeerDesc *allDescs = nullptr;
@@ -623,8 +642,8 @@ int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size) {
   // before any peer starts opening handles. In particular, do not return
   // before the all-gather when one rank cannot export its allocation; that
   // would leave its local peers blocked in this collective.
-  for (int lr = 0; lr < localRanks; lr++) {
-    int globalR = localRankToRank[lr];
+  for (int lr = 0; lr < peerCount; lr++) {
+    int globalR = allRanks ? lr : localRankToRank[lr];
     struct flagcxIpcPeerDesc *pd = &allDescs[globalR];
     if (!pd->valid) {
       INFO(FLAGCX_INIT,
@@ -647,21 +666,21 @@ int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size) {
   }
 
   // Step 3: Open peer IPC handles
-  hostPeerPtrs = (void **)malloc(localRanks * sizeof(void *));
+  hostPeerPtrs = (void **)malloc(peerCount * sizeof(void *));
   if (!hostPeerPtrs) {
     res = flagcxSystemError;
     goto fail;
   }
-  memset(hostPeerPtrs, 0, localRanks * sizeof(void *));
-  hostPeerBasePtrs = (void **)malloc(localRanks * sizeof(void *));
+  memset(hostPeerPtrs, 0, peerCount * sizeof(void *));
+  hostPeerBasePtrs = (void **)malloc(peerCount * sizeof(void *));
   if (!hostPeerBasePtrs) {
     res = flagcxSystemError;
     goto fail;
   }
-  memset(hostPeerBasePtrs, 0, localRanks * sizeof(void *));
+  memset(hostPeerBasePtrs, 0, peerCount * sizeof(void *));
 
-  for (int lr = 0; lr < localRanks; lr++) {
-    int globalR = localRankToRank[lr];
+  for (int lr = 0; lr < peerCount; lr++) {
+    int globalR = allRanks ? lr : localRankToRank[lr];
     if (globalR == myRank) {
       hostPeerPtrs[lr] = buff;
     } else {
@@ -691,11 +710,11 @@ int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size) {
 
   // Step 4: Build device-side peer pointer array
   FLAGCXCHECKGOTO(deviceAdaptor->deviceMalloc((void **)&devPeerPtrs,
-                                              localRanks * sizeof(void *),
+                                              peerCount * sizeof(void *),
                                               flagcxMemDevice, NULL),
                   res, fail);
   FLAGCXCHECKGOTO(deviceAdaptor->deviceMemcpy(
-                      devPeerPtrs, hostPeerPtrs, localRanks * sizeof(void *),
+                      devPeerPtrs, hostPeerPtrs, peerCount * sizeof(void *),
                       flagcxMemcpyHostToDevice, NULL, NULL),
                   res, fail);
 
@@ -703,14 +722,14 @@ int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size) {
   comm->ipcTable[slot].hostPeerPtrs = hostPeerPtrs;
   comm->ipcTable[slot].hostPeerBasePtrs = hostPeerBasePtrs;
   comm->ipcTable[slot].devPeerPtrs = devPeerPtrs;
-  comm->ipcTable[slot].nPeers = localRanks;
+  comm->ipcTable[slot].nPeers = peerCount;
   comm->ipcTable[slot].basePtr = buff;
   comm->ipcTable[slot].inUse = true;
 
   INFO(FLAGCX_INIT,
        "buildIpcPeerPointers: rank %d slot %d buff=%p devPeerPtrs=%p", myRank,
        slot, buff, (void *)devPeerPtrs);
-  for (int lr = 0; lr < localRanks; lr++) {
+  for (int lr = 0; lr < peerCount; lr++) {
     INFO(FLAGCX_INIT,
          "buildIpcPeerPointers:   hostPeerPtrs[%d]=%p mappingBase=%p", lr,
          hostPeerPtrs[lr], hostPeerBasePtrs[lr]);
@@ -720,7 +739,7 @@ int buildIpcPeerPointers(flagcxComm_t comm, void *buff, size_t size) {
 fail:
   free(allDescs);
   if (hostPeerBasePtrs) {
-    for (int i = 0; i < localRanks; i++) {
+    for (int i = 0; i < peerCount; i++) {
       if (hostPeerBasePtrs[i])
         deviceAdaptor->ipcMemHandleClose(hostPeerBasePtrs[i]);
     }

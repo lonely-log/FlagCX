@@ -838,6 +838,28 @@ defaultDevApiCommCreate(flagcxComm_t comm,
     }
   }
 
+  // World-rank indexed proxy-plane pointers. Host-posted signal updates
+  // cannot be scheduled while the application kernel spins in waitSignal, so
+  // the proxy plane is reached from inside the kernel when every rank is
+  // IPC-reachable.
+  if (devComm->signalBuffer != nullptr && comm->heteroComm != nullptr &&
+      getenv("FLAGCX_NO_WORLD_SIGNAL") == NULL) {
+    size_t proxySigSize = (size_t)devComm->signalCount *
+                          (size_t)devComm->contextCount * sizeof(uint64_t);
+    int proxySlot =
+        buildIpcPeerPointersAllRanks(comm, devComm->signalBuffer, proxySigSize);
+    if (proxySlot >= 0) {
+      devComm->proxySignalPeerPtrs = comm->ipcTable[proxySlot].devPeerPtrs;
+      INFO(FLAGCX_INIT,
+           "defaultDevApiCommCreate: proxySignalPeerPtrs IPC slot=%d ptr=%p",
+           proxySlot, (void *)devComm->proxySignalPeerPtrs);
+    } else {
+      INFO(FLAGCX_INIT,
+           "defaultDevApiCommCreate: world-ranked proxy signal table "
+           "unavailable; inter-node signals stay on the proxy path");
+    }
+  }
+
   if (sizeof(DefaultCompletionWord) == sizeof(uint32_t)) {
     // The direct and proxy planes are independent, so local IPC and remote
     // Net signals may coexist in one communicator.
@@ -849,6 +871,40 @@ defaultDevApiCommCreate(flagcxComm_t comm,
         hostMappedSignals
             ? (!forceOneSidedNet && devComm->signalDevPeerPtrsRaw != nullptr)
             : (devComm->nInterPeers == 0 && devComm->signalIpcSlot >= 0);
+  }
+  if (getenv("FLAGCX_KP_TRACE") != NULL) {
+    fprintf(stderr,
+            "[MODES] rank=%d wordBytes=%zu useP2pSignals=%d signalIpcSlot=%d "
+            "nInterPeers=%d netSignalReady=%d signalHostEnable=%d "
+            "forceNet=%d\n",
+            comm->rank, sizeof(DefaultCompletionWord), devComm->useP2pSignals,
+            devComm->signalIpcSlot, devComm->nInterPeers,
+            devComm->netSignalReady, (int)flagcxParamSignalHostEnable(),
+            (int)flagcxParamDeviceOneSidedForceNet());
+    fprintf(stderr,
+            "[BUFS] rank=%d signalBuffer=%p completionSignalBuffer=%p "
+            "shadowBuffer=%p counterBuffer=%p completionCounterBuffer=%p "
+            "signalCount=%d counterCount=%d contextCount=%d\n",
+            comm->rank, (void *)devComm->signalBuffer,
+            (void *)devComm->completionSignalBuffer,
+            (void *)devComm->shadowBuffer, (void *)devComm->counterBuffer,
+            (void *)devComm->completionCounterBuffer, devComm->signalCount,
+            devComm->counterCount, devComm->contextCount);
+    {
+      int curDev = -1;
+      if (deviceAdaptor != NULL && deviceAdaptor->getDevice != NULL)
+        (void)deviceAdaptor->getDevice(&curDev);
+      fprintf(stderr,
+              "[DEV] rank=%d cudaDev=%d curDev=%d intraRank=%d nNodes=%d "
+              "nInterPeers=%d\n",
+              comm->rank,
+              (comm->heteroComm != NULL) ? comm->heteroComm->cudaDev : -1,
+              curDev, comm->localRank,
+              (comm->heteroComm != NULL) ? comm->heteroComm->nNodes : -1,
+              devComm->nInterPeers);
+      fflush(stderr);
+    }
+    fflush(stderr);
   }
 
   if (devComm->signalBuffer &&
