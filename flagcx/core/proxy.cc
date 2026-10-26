@@ -3080,7 +3080,10 @@ static void flagcxKernelWorkerFinish(void *state) {
     flagcxResult_t terminal = __atomic_load_n(
         &comm->proxyState->kernelState.terminalResult, __ATOMIC_ACQUIRE);
     flagcxKernelProxyStoreLocalTerminal(fifo, terminal);
-    if (terminal != flagcxSuccess && fifo != NULL) {
+    // The buffer behind `fifo` may already have been released by a
+    // concurrent teardown; writing the control words through it is a
+    // use-after-free.
+    if (terminal != flagcxSuccess && fifo != NULL && fifo->buffer != NULL) {
       // terminalStatus is published before the gate is closed. A producer that
       // loses the gate CAS observes that status; one that won the CAS remains
       // counted until it publishes or abandons its reservation.
@@ -3098,7 +3101,10 @@ static void flagcxKernelWorkerFinish(void *state) {
     terminal = __atomic_load_n(&comm->proxyState->kernelState.terminalResult,
                                __ATOMIC_ACQUIRE);
     flagcxKernelProxyStoreLocalTerminal(fifo, terminal);
-    if (terminal != flagcxSuccess && fifo != NULL) {
+    // The buffer behind `fifo` may already have been released by a
+    // concurrent teardown; writing the control words through it is a
+    // use-after-free.
+    if (terminal != flagcxSuccess && fifo != NULL && fifo->buffer != NULL) {
       // Drain may itself discover the first transport failure. Close the gate
       // here as well so the final produced snapshot is stable in both paths.
       if (!producerGateClosed) {
