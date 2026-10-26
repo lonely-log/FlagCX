@@ -96,5 +96,9 @@ flagcxResult_t flagcxResolveIpcPeerAddress(void *importedBase,
                                            size_t userOffset, size_t userSize,
                                            void **peerPtr);
 int buildIpcPeerPointers(struct flagcxComm *comm, void *buff, size_t size);
+// World-rank indexed variant; valid only when every rank's allocation is
+// IPC-reachable from every other rank (single-host emulation).
+int buildIpcPeerPointersAllRanks(struct flagcxComm *comm, void *buff,
+                                 size_t size);
 
 #endif // FLAGCX_ONESIDED_H_

@@ -221,6 +221,10 @@ struct CommTraits<DefaultBackend<PlatformTag>> {
     // signalPeerPtrs[peer] → peer's signalBuffer (nullptr if not P2P-reachable)
     uint64_t **signalPeerPtrs;
 
+    // World-rank indexed pointers to every rank's 64-bit proxy signal buffer.
+    // NULL when the deployment cannot reach all ranks through IPC.
+    uint64_t **proxySignalPeerPtrs;
+
     FLAGCX_DEVICE_INLINE_DECORATOR int getIntraRank() const {
       return intraRank;
     }
@@ -245,6 +249,11 @@ struct CommTraits<DefaultBackend<PlatformTag>> {
 
     FLAGCX_DEVICE_INLINE_DECORATOR uint64_t *getSignalPeerPtr(int peer) const {
       return signalPeerPtrs ? signalPeerPtrs[peer] : nullptr;
+    }
+
+    FLAGCX_DEVICE_INLINE_DECORATOR uint64_t *
+    getProxySignalPeerPtr(int worldPeer) const {
+      return proxySignalPeerPtrs ? proxySignalPeerPtrs[worldPeer] : nullptr;
     }
 
     FLAGCX_DEVICE_INLINE_DECORATOR CompletionWord *
@@ -299,6 +308,8 @@ struct CommTraits<DefaultBackend<PlatformTag>> {
       dc.counterCount = di.counterCount;
       dc.contextCount = di.contextCount;
       dc.signalPeerPtrs = di.signalPeerPtrs;
+      dc.proxySignalPeerPtrs =
+          reinterpret_cast<uint64_t **>(di.proxySignalPeerPtrs);
       dc.netOneSidedReady = di.netOneSidedReady;
       dc.netSignalReady = di.netSignalReady;
       dc.netPutValueReady = di.netPutValueReady;
@@ -902,21 +913,26 @@ struct CommTraits<DefaultBackend<PlatformTag>> {
       if (coop.threadRank() == 0) {
         if (isSignal(ra)) {
           validateCompletionValue(getSignalValue(ra));
-          int localPeer = worldPeer - (_dc.rank - _dc.intraRank);
-          CompletionWord *peerSignal =
-              (localPeer >= 0 && localPeer < _dc.intraSize)
-                  ? getPeerSignalPtr(localPeer,
-                                     (flagcxDevSignal_t)getSignalIdx(ra))
+          // Prefer the world-rank indexed proxy plane: the update then happens
+          // inside this already-resident kernel. A host-posted update cannot
+          // be scheduled reliably while the peer is spinning in waitSignal.
+          uint64_t *peerSignal =
+              (worldPeer >= 0 && worldPeer < _dc.getSize())
+                  ? _dc.getProxySignalPeerPtr(worldPeer)
                   : nullptr;
-          bool useDirect = CompletionStorage::useDirectSignal(
-              peerSignal != nullptr, _dc.usesDirectP2pSignals());
-          if (useDirect)
+          if (peerSignal != nullptr) {
+            // Order this signal after any previously posted one-sided write.
+            if (fifoBuffer != nullptr)
+              fifoFlush(fifoBuffer);
             Atomic::fetchAdd(
-                peerSignal,
-                CompletionStorage::completionValue(getSignalValue(ra)),
+                reinterpret_cast<unsigned int *>(
+                    &peerSignal[_contextId * signalCount +
+                                (int)getSignalIdx(ra)]),
+                static_cast<unsigned int>(getSignalValue(ra)),
                 flagcxDeviceMemoryOrderRelease);
-          else
+          } else {
             enqueueFifoSignalAction(ra, worldPeer, 0);
+          }
         }
       }
       coop.sync();
@@ -1167,13 +1183,16 @@ struct Barrier<DefaultBackend<P>, flagcxTeamTagInter, Coop> {
   int _barrierSignal0; // base signal slot for this barrier instance
   int _stride;         // intraSize — used to compute target global rank
   int _localRank;      // intra-node rank (for rank-to-rank peer mapping)
+  // World-rank indexed proxy signal buffers (NULL when unreachable).
+  uint64_t **_proxySignalPeerPtrs;
 
   // Default ctor (no-op)
   FLAGCX_DEVICE_INLINE_DECORATOR
   Barrier()
       : _coop(), _fifoBuffer(nullptr), _signalBuffer(nullptr),
         _shadowBuffer(nullptr), _signalCount(0), _contextId(0), _teamRank(0),
-        _nTeamRanks(0), _barrierSignal0(0), _stride(0), _localRank(0) {}
+        _nTeamRanks(0), _barrierSignal0(0), _stride(0), _localRank(0),
+        _proxySignalPeerPtrs(nullptr) {}
 
   // Active ctor
   FLAGCX_DEVICE_INLINE_DECORATOR
@@ -1184,7 +1203,8 @@ struct Barrier<DefaultBackend<P>, flagcxTeamTagInter, Coop> {
         _signalCount(net.signalCount), _contextId(net.getContextId()),
         _teamRank(net.teamRank), _nTeamRanks(net.nTeamRanks),
         _barrierSignal0(net.barrierSignalBase + (int)index * net.nTeamRanks),
-        _stride(dc.intraSize), _localRank(dc.intraRank) {
+        _stride(dc.intraSize), _localRank(dc.intraRank),
+        _proxySignalPeerPtrs(net._dc.proxySignalPeerPtrs) {
     assert(index < FLAGCX_DEVICE_CTA_COUNT);
   }
 
@@ -1204,6 +1224,17 @@ struct Barrier<DefaultBackend<P>, flagcxTeamTagInter, Coop> {
       // signalIdx = barrierSignal0 + myTeamRank (where peer expects my signal)
       int signalIdx = _barrierSignal0 + _teamRank;
       int combinedIdx = _contextId * _signalCount + signalIdx;
+      // Deliver in-kernel when the peer's proxy plane is mapped: a host-posted
+      // arrival can stall behind this very kernel's spin loop.
+      uint64_t *peerSignal =
+          (_proxySignalPeerPtrs != nullptr) ? _proxySignalPeerPtrs[targetRank]
+                                            : nullptr;
+      if (peerSignal != nullptr) {
+        Atomic::fetchAdd(
+            reinterpret_cast<unsigned int *>(&peerSignal[combinedIdx]), 1u,
+            flagcxDeviceMemoryOrderRelease);
+        continue;
+      }
       uint64_t trdSpecific =
           ((uint64_t)0 << flagcxDeviceTriggerOffBufferType) |
           ((uint64_t)combinedIdx << flagcxDeviceTriggerOffSignalIdxSig) |

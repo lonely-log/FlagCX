@@ -130,6 +130,11 @@ struct flagcxDevCommInternal {
   uint64_t **signalPeerPtrs; // Device array: [localRanks] → peer signal bufs
   int signalIpcSlot; // IPC table slot for signal peer pointers (-1 if not used)
   void **completionSignalPeerPtrs;
+  // World-rank indexed device array of pointers to every rank's 64-bit proxy
+  // signal buffer (NULL where not IPC-reachable). Populated only when all ranks
+  // share host memory; it lets the device kernel signal a peer outside its
+  // local group with an in-kernel atomic instead of the host proxy path.
+  void **proxySignalPeerPtrs;
 
   // ---- Vendor device comm (set if adaptor->devCommCreate succeeds, else NULL)
   // ----
