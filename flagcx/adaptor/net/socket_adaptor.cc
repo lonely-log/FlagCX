@@ -802,6 +802,35 @@ static flagcxResult_t flagcxNetSocketMrImport(uint32_t key, void **baseOut,
     }
   }
 
+  // A key can name one of our own registrations: one-sided all-to-all includes
+  // a self entry, and cudaIpcOpenMemHandle refuses handles created by this very
+  // process. Resolve it locally.
+  for (struct flagcxSockMr *own = g_sockMrs; own != NULL; own = own->next) {
+    if (own->key != key)
+      continue;
+    struct flagcxSockPeerMr *self =
+        (struct flagcxSockPeerMr *)calloc(1, sizeof(*self));
+    if (self == NULL) {
+      pthread_mutex_unlock(&g_sockPeerMrLock);
+      return flagcxSystemError;
+    }
+    self->key = key;
+    self->base = (void *)own->addr;
+    self->allocSize = own->size;
+    self->userOffset = 0;
+    self->ownerVa = (uint64_t)own->addr;
+    self->ownerPid = (int)getpid();
+    self->next = g_sockPeerMrs;
+    g_sockPeerMrs = self;
+    *baseOut = self->base;
+    if (allocOut != NULL)
+      *allocOut = self->allocSize;
+    if (offOut != NULL)
+      *offOut = self->userOffset;
+    pthread_mutex_unlock(&g_sockPeerMrLock);
+    return flagcxSuccess;
+  }
+
   char path[64];
   flagcxNetSocketMrPath(key, path, sizeof(path));
   struct flagcxSockMrFile rec;

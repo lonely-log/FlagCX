@@ -7,7 +7,9 @@
 #include "device_api/flagcx_device_internal.h"
 #include "device_api/flagcx_device_core.h"
 #include <cuda_runtime.h>
+#include <sched.h>
 #include <stdio.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <new>
@@ -47,9 +49,24 @@ extern "C" void flagcxDevNetLaunchConstruct(void *devNets, void *devComm,
 
 // One transfer stream per posting thread. Sharing a single stream makes every
 // cudaStreamSynchronize wait for the other proxy contexts' transfers as well.
+#define FLAGCX_SOCK_CHUNK (64u * 1024u)
+
 static __thread cudaStream_t flagcxSockDevStream = nullptr;
 static __thread void *flagcxSockBounce = nullptr;
 static __thread size_t flagcxSockBounceSize = 0;
+
+// Wait for this thread's stream without forcing the device to drain other
+// streams. cudaStreamSynchronize is not safe here: it can wait for an
+// application kernel that is itself waiting for this transfer.
+static cudaError_t flagcxSockStreamPoll(cudaStream_t stream) {
+  for (;;) {
+    cudaError_t err = cudaStreamQuery(stream);
+    if (err == cudaSuccess)
+      return cudaSuccess;
+    if (err != cudaErrorNotReady)
+      return err;
+  }
+}
 
 static cudaError_t flagcxSockBounceBuffer(void **out, size_t size) {
   if (flagcxSockBounceSize >= size && flagcxSockBounce != nullptr) {
@@ -70,11 +87,6 @@ static cudaError_t flagcxSockBounceBuffer(void **out, size_t size) {
   flagcxSockBounceSize = want;
   *out = flagcxSockBounce;
   return cudaSuccess;
-}
-
-static __global__ void flagcxSockDevSignalAddKernel(unsigned int *addr,
-                                                   unsigned int value) {
-  atomicAdd(addr, value);
 }
 
 static int flagcxSockDevStreamEnsure(cudaStream_t *out) {
@@ -154,7 +166,7 @@ extern "C" int flagcxSockDevTransfer(void *dst, const void *src, size_t size,
     if (copyType == 2 && dst == src)
       return 0;
     if (copyType != 2) {
-      // Host-direction transfer: one synchronous hop, no bounce.
+      // Host-direction transfer: one blocking hop, no bounce.
       err = cudaMemcpy(dst, src, size, kinds[copyType]);
       if (err != cudaSuccess)
         return (int)err;
@@ -166,28 +178,31 @@ extern "C" int flagcxSockDevTransfer(void *dst, const void *src, size_t size,
       if (signalPtr == nullptr)
         return 0;
     } else {
-    // Bounce through pinned host memory: every hop stays on the local device.
+    // Bounce through pinned host memory in bounded chunks: every hop stays on
+    // the local device, and no single host-issued copy is big enough to stall
+    // behind a resident application kernel.
     void *bounce = nullptr;
-    err = flagcxSockBounceBuffer(&bounce, size);
+    err = flagcxSockBounceBuffer(&bounce, FLAGCX_SOCK_CHUNK);
     if (err != cudaSuccess)
       return (int)err;
-    err = cudaMemcpy(bounce, src, size, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess)
-      return (int)err;
-    if (xtrace) {
-      fprintf(stderr, "[XFER] pid=%d id=%d s=bounce_read_issued\n",
-              (int)getpid(), xid);
-      fflush(stderr);
+    const char *srcBytes = (const char *)src;
+    char *dstBytes = (char *)dst;
+    size_t done = 0;
+    while (done < size) {
+      size_t n = size - done;
+      if (n > FLAGCX_SOCK_CHUNK)
+        n = FLAGCX_SOCK_CHUNK;
+      err = cudaMemcpy(bounce, srcBytes + done, n, cudaMemcpyDeviceToHost);
+      if (err != cudaSuccess)
+        return (int)err;
+      err = cudaMemcpy(dstBytes + done, bounce, n, cudaMemcpyHostToDevice);
+      if (err != cudaSuccess)
+        return (int)err;
+      done += n;
     }
-    err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess)
-      return (int)err;
-    err = cudaMemcpy(dst, bounce, size, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess)
-      return (int)err;
     if (xtrace) {
-      fprintf(stderr, "[XFER] pid=%d id=%d s=bounce_write_done\n",
-              (int)getpid(), xid);
+      fprintf(stderr, "[XFER] pid=%d id=%d s=bounce_done size=%zu\n",
+              (int)getpid(), xid, size);
       fflush(stderr);
     }
     }
@@ -198,14 +213,26 @@ extern "C" int flagcxSockDevTransfer(void *dst, const void *src, size_t size,
   // transport primitive that always makes progress here. The proxy thread
   // serialises its own posts and each signal word has a single writer per
   // phase, so this preserves the counter semantics.
+  // Several processes may add to the same signal word (T2 PutSigInc: every
+  // inter peer increments the receiver's slot 0), so the read/add/write has to
+  // be serialised across processes. A GPU helper kernel would be atomic too but
+  // waiting on it from a proxy thread can wedge, so use an inter-process lock.
+  // Signal traffic is a handful of words per round, so one lock file is enough.
+  int lockFd = open("/dev/shm/flagcx-socklock", O_CREAT | O_RDWR, 0644);
+  if (lockFd >= 0)
+    (void)flock(lockFd, LOCK_EX);
   unsigned long long current = 0;
-  cudaError_t err = cudaMemcpy(&current, signalPtr, sizeof(current),
-                              cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess)
-    return (int)err;
-  const unsigned long long updated = current + signalValue;
-  err = cudaMemcpy(signalPtr, &updated, sizeof(updated),
-                   cudaMemcpyHostToDevice);
+  cudaError_t err =
+      cudaMemcpy(&current, signalPtr, sizeof(current), cudaMemcpyDeviceToHost);
+  if (err == cudaSuccess) {
+    const unsigned long long updated = current + signalValue;
+    err = cudaMemcpy(signalPtr, &updated, sizeof(updated),
+                     cudaMemcpyHostToDevice);
+  }
+  if (lockFd >= 0) {
+    (void)flock(lockFd, LOCK_UN);
+    close(lockFd);
+  }
   if (xtrace) {
     fprintf(stderr, "[XFER] pid=%d id=%d s=signal_done cur=%llu err=%d\n",
             (int)getpid(), xid, current, (int)err);
