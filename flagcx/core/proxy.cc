@@ -1929,6 +1929,14 @@ static flagcxResult_t flagcxKernelProxyPost(
 
   void *request = NULL;
   flagcxResult_t res = flagcxSuccess;
+  if (getenv("FLAGCX_POST_TRACE") != NULL) {
+    fprintf(stderr,
+            "[POST] enter rank=%d ctx=%d type=%d peer=%d size=%zu srcOff=%llu "
+            "dstOff=%llu slot=%u\n",
+            comm->rank, contextId, type, peer, size,
+            (unsigned long long)srcOff, (unsigned long long)dstOff, requestSlot);
+    fflush(stderr);
+  }
   {
     flagcxKernelSubmitScope submitScope(submit);
     if (getenv("FLAGCX_KP_TRACE") != NULL) {
@@ -2008,6 +2016,12 @@ static flagcxResult_t flagcxKernelProxyPost(
     }
   }
 
+  if (getenv("FLAGCX_POST_TRACE") != NULL) {
+    fprintf(stderr,
+            "[POST] exit rank=%d ctx=%d type=%d res=%d request=%p slot=%u\n",
+            comm->rank, contextId, type, (int)res, request, requestSlot);
+    fflush(stderr);
+  }
   if (request != NULL) {
     flagcxResult_t completionResult =
         res == flagcxInProgress ? flagcxSuccess : res;
@@ -2227,6 +2241,23 @@ init_done:
       break;
 
     flagcxKernelProxyPoll(kproxyState, comm);
+    if (getenv("FLAGCX_FIFODUMP") != NULL) {
+      static time_t lastBusy = 0;
+      time_t nowBusy = time(NULL);
+      if (nowBusy - lastBusy >= 3) {
+        lastBusy = nowBusy;
+        uint64_t bctl[8] = {0};
+        flagcxDevSockRead(bctl, fifo->buffer, sizeof(bctl));
+        fprintf(stderr,
+                "[WDOGB] t=%ld rank=%d ctx=%d hasPending=%d cons=%u prod=%u "
+                "comp=%u term=%u inflight=%u\n",
+                (long)nowBusy, comm->rank, contextId, hasPending ? 1 : 0,
+                (unsigned)(uint32_t)bctl[1], (unsigned)(uint32_t)bctl[2],
+                (unsigned)(uint32_t)bctl[3], (unsigned)(uint32_t)bctl[4],
+                kproxyState->transport.nativeInflight);
+        fflush(stderr);
+      }
+    }
     flagcxResult_t terminal = __atomic_load_n(
         &comm->proxyState->kernelState.terminalResult, __ATOMIC_ACQUIRE);
     if (terminal != flagcxSuccess) {
@@ -2614,7 +2645,7 @@ out:
     flagcxResult_t terminal = __atomic_load_n(
         &comm->proxyState->kernelState.terminalResult, __ATOMIC_ACQUIRE);
     flagcxKernelProxyStoreLocalTerminal(fifo, terminal);
-    if (terminal != flagcxSuccess && fifo != NULL) {
+    if (terminal != flagcxSuccess && fifo != NULL && fifo->buffer != NULL) {
       // terminalStatus is published before the gate is closed. A producer that
       // loses the gate CAS observes that status; one that won the CAS remains
       // counted until it publishes or abandons its reservation.
@@ -2632,7 +2663,7 @@ out:
     terminal = __atomic_load_n(&comm->proxyState->kernelState.terminalResult,
                                __ATOMIC_ACQUIRE);
     flagcxKernelProxyStoreLocalTerminal(fifo, terminal);
-    if (terminal != flagcxSuccess && fifo != NULL) {
+    if (terminal != flagcxSuccess && fifo != NULL && fifo->buffer != NULL) {
       // Drain may itself discover the first transport failure. Close the gate
       // here as well so the final produced snapshot is stable in both paths.
       if (!producerGateClosed) {
