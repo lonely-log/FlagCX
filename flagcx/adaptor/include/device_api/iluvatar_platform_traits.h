@@ -190,10 +190,13 @@ struct PlatformTraits<IluvatarPlatform> {
         // Same thread: no cache is involved, only instruction scheduling.
         asm volatile("" ::: "memory");
       } else if (Scope == flagcxDeviceScopeBlock) {
-        // Measured on ivcore11: __threadfence_block lowers to no instruction at
-        // all. Warps in one CTA share an L1, so block-scope ordering is carried
-        // by the cache hierarchy plus the compiler barrier; only the device
-        // level actually costs a writeback/invalidate.
+        // Measured on ivcore11: __threadfence_block lowers to a bare sl_wait
+        // (wait for the wave's outstanding LSA operations) and never to
+        // ml_lsa_wbinv, so block scope costs no L2 writeback/invalidate. Warps
+        // in one CTA share an L1, so the cache hierarchy plus that wait carries
+        // the ordering. A sl_wait issued directly after another one coalesces,
+        // which is why an acquire load shows no block/thread split in the ISA
+        // while a store does. Only the device level pays for a wbinv.
         FLAGCX_DEVICE_BLOCK_FENCE();
       } else {
         FLAGCX_DEVICE_THREAD_FENCE();
