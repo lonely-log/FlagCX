@@ -487,6 +487,20 @@ static flagcxResult_t preconnectFullMesh(flagcxComm_t comm) {
   return flagcxSuccess;
 }
 
+// The world-rank proxy plane is reachable from inside the kernel whenever every
+// rank's allocation is IPC-mapped, which is a property of single-host
+// deployments in general rather than of one vendor. Building that table replaces
+// the host FIFO signal that upstream ships for every peer, and the replacement
+// has only been validated on one device family, so it stays off elsewhere.
+// FLAGCX_WORLD_SIGNAL=1/0 overrides the default.
+static bool flagcxWorldRankSignalsEnabled() {
+  const char *opt = getenv("FLAGCX_WORLD_SIGNAL");
+  if (opt != NULL && opt[0] != '\0')
+    return opt[0] != '0';
+  return deviceAdaptor != NULL &&
+         deviceAdaptor->gdrDeviceFamily == FLAGCX_GDR_DEVICE_ILUVATAR;
+}
+
 // ==========================================================================
 // DevComm Create — full default backend implementation
 // ==========================================================================
@@ -843,7 +857,8 @@ defaultDevApiCommCreate(flagcxComm_t comm,
   // the proxy plane is reached from inside the kernel when every rank is
   // IPC-reachable.
   if (devComm->signalBuffer != nullptr && comm->heteroComm != nullptr &&
-      getenv("FLAGCX_NO_WORLD_SIGNAL") == NULL) {
+      getenv("FLAGCX_NO_WORLD_SIGNAL") == NULL &&
+      flagcxWorldRankSignalsEnabled()) {
     size_t proxySigSize = (size_t)devComm->signalCount *
                           (size_t)devComm->contextCount * sizeof(uint64_t);
     int proxySlot =

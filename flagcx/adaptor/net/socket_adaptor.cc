@@ -661,6 +661,22 @@ struct flagcxSockMr {
 static struct flagcxSockMr *g_sockMrs = NULL;
 static pthread_mutex_t g_sockMrLock = PTHREAD_MUTEX_INITIALIZER;
 
+// Host-mediated one-sided support. Upstream leaves iput/iget/iputSignal NULL for
+// this adaptor ("not supported on socket"), and filling them changes behaviour
+// for every deployment that uses the socket transport. The path has only been
+// validated on one device family, so it is confined to that family here and can
+// be forced either way with FLAGCX_SOCK_ONESIDED=1/0. Nothing else in the socket
+// adaptor depends on this: the two-sided send/recv path is untouched.
+static int flagcxSockOneSidedEnabled(void) {
+  const char *opt = getenv("FLAGCX_SOCK_ONESIDED");
+  if (opt != NULL && opt[0] != '\0')
+    return opt[0] != '0';
+  return (deviceAdaptor != NULL &&
+          deviceAdaptor->gdrDeviceFamily == FLAGCX_GDR_DEVICE_ILUVATAR)
+             ? 1
+             : 0;
+}
+
 struct flagcxSockPeerMr {
   uint32_t key;
   void *base;
@@ -1017,6 +1033,9 @@ flagcxResult_t flagcxNetSocketIget(void *sendComm, uint64_t srcOff,
                                    int dstRank, void **srcHandles,
                                    void **dstHandles, void **request) {
   (void)sendComm;
+  // Same answer upstream gives by leaving the slot NULL.
+  if (!flagcxSockOneSidedEnabled())
+    return flagcxNotSupported;
   if (request == NULL)
     return flagcxInvalidArgument;
   *request = NULL;
@@ -1072,7 +1091,7 @@ flagcxResult_t flagcxNetSocketRegMr(void *comm, void *data, size_t size,
                        1u);
 
   // Export device memory so that a peer process on this host can reach it.
-  if (!mr->isHost && deviceAdaptor != NULL &&
+  if (!mr->isHost && flagcxSockOneSidedEnabled() && deviceAdaptor != NULL &&
       deviceAdaptor->ipcMemHandleCreate != NULL &&
       deviceAdaptor->ipcMemHandleGet != NULL) {
     void *exportBase = NULL;
@@ -1111,7 +1130,11 @@ flagcxResult_t flagcxNetSocketRegMr(void *comm, void *data, size_t size,
   g_sockMrs = mr;
   pthread_mutex_unlock(&g_sockMrLock);
   *mhandle = (void *)mr;
-  flagcxNetSocketMrPublish(mr);
+  // Only a peer that uses the one-sided path needs the registry entry, and only
+  // it should create files under /dev/shm. A two-sided-only deployment would
+  // otherwise leave flagcx-sockmr-* files behind if it exits abnormally.
+  if (flagcxSockOneSidedEnabled())
+    flagcxNetSocketMrPublish(mr);
 
   if (getenv("FLAGCX_KP_TRACE") != NULL) {
     fprintf(stderr,
@@ -1230,6 +1253,9 @@ flagcxResult_t flagcxNetSocketIput(void *sendComm, uint64_t srcOff,
                                    int dstRank, void **srcHandles,
                                    void **dstHandles, void **request) {
   (void)sendComm;
+  // Same answer upstream gives by leaving the slot NULL.
+  if (!flagcxSockOneSidedEnabled())
+    return flagcxNotSupported;
   if (request == NULL)
     return flagcxInvalidArgument;
   *request = NULL;
@@ -1274,6 +1300,9 @@ flagcxResult_t flagcxNetSocketIputSignal(void *sendComm, uint64_t srcOff,
                                          uint64_t signalValue,
                                          void **request) {
   (void)sendComm;
+  // Same answer upstream gives by leaving the slot NULL.
+  if (!flagcxSockOneSidedEnabled())
+    return flagcxNotSupported;
   if (request == NULL)
     return flagcxInvalidArgument;
   *request = NULL;
