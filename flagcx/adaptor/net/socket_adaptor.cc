@@ -661,22 +661,6 @@ struct flagcxSockMr {
 static struct flagcxSockMr *g_sockMrs = NULL;
 static pthread_mutex_t g_sockMrLock = PTHREAD_MUTEX_INITIALIZER;
 
-// Host-mediated one-sided support. Upstream leaves iput/iget/iputSignal NULL for
-// this adaptor ("not supported on socket"), and filling them changes behaviour
-// for every deployment that uses the socket transport. The path has only been
-// validated on one device family, so it is confined to that family here and can
-// be forced either way with FLAGCX_SOCK_ONESIDED=1/0. Nothing else in the socket
-// adaptor depends on this: the two-sided send/recv path is untouched.
-static int flagcxSockOneSidedEnabled(void) {
-  const char *opt = getenv("FLAGCX_SOCK_ONESIDED");
-  if (opt != NULL && opt[0] != '\0')
-    return opt[0] != '0';
-  return (deviceAdaptor != NULL &&
-          deviceAdaptor->gdrDeviceFamily == FLAGCX_GDR_DEVICE_ILUVATAR)
-             ? 1
-             : 0;
-}
-
 struct flagcxSockPeerMr {
   uint32_t key;
   void *base;
@@ -709,6 +693,33 @@ extern "C" int flagcxSockDevTransfer(void *dst, const void *src, size_t size,
 extern "C" int flagcxSockDevMemRange(void *ptr, void **base, size_t *size);
 #define FLAGCX_SOCK_HAS_DEV_TRANSFER 1
 #endif
+
+// Host-mediated one-sided support.
+//
+// Upstream leaves iput/iget/iputSignal/getMrInfo NULL for this adaptor ("not
+// supported on socket").  Nine call sites probe exactly those pointers before
+// letting a request into the one-sided implementation, so advertising them
+// conditionally at run time would still change behaviour: the probes would pass
+// and the request would fail deeper instead of being refused up front.  The
+// slots are therefore advertised only when this build really has the device
+// transfer helper the path needs, which is a compile-time property.
+//
+// On top of that compile-time switch, a build that has the helper may still turn
+// the path off (FLAGCX_SOCK_ONESIDED=0) or on (FLAGCX_SOCK_ONESIDED=1); the
+// default is the device family it has been validated on.
+static int flagcxSockOneSidedEnabled(void) {
+#ifdef FLAGCX_SOCK_HAS_DEV_TRANSFER
+  const char *opt = getenv("FLAGCX_SOCK_ONESIDED");
+  if (opt != NULL && opt[0] != '\0')
+    return opt[0] != '0';
+  return (deviceAdaptor != NULL &&
+          deviceAdaptor->gdrDeviceFamily == FLAGCX_GDR_DEVICE_ILUVATAR)
+             ? 1
+             : 0;
+#else
+  return 0;
+#endif
+}
 
 // Resolve the allocation that backs `buff` so the exported IPC handle and the
 // user offset are consistent: cudaIpcOpenMemHandle always yields the
@@ -1425,9 +1436,15 @@ flagcxNetAdaptor flagcxNetSocket = {
     flagcxNetSocketTest,
 
     // One-sided functions
+#ifdef FLAGCX_SOCK_HAS_DEV_TRANSFER
     flagcxNetSocketIput,
     flagcxNetSocketIget,
     flagcxNetSocketIputSignal,
+#else
+    NULL, // iput - not supported on socket
+    NULL, // iget - not supported on socket
+    NULL, // iputSignal - not supported on socket
+#endif
 
     // Device name lookup
     NULL, // getDevFromName
@@ -1436,7 +1453,11 @@ flagcxNetAdaptor flagcxNetSocket = {
     NULL, // iputBatch
     NULL, // testBatch
     NULL, // igetBatch
+#ifdef FLAGCX_SOCK_HAS_DEV_TRANSFER
     flagcxNetSocketGetMrInfo,
+#else
+    NULL, // getMrInfo
+#endif
 
     // Latest-only VMM MR capabilities and internal metadata
     FLAGCX_VMM_MR_CAP_NONE,
