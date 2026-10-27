@@ -190,6 +190,10 @@
 // to the CoreX cache writeback/invalidate operation used by peer-visible P2P
 // synchronization in IXCCL and in FlagTree PR 1184.
 #define FLAGCX_DEVICE_THREAD_FENCE __threadfence
+// Block-scope fence: threads inside one CTA share an L1, so ordering only has
+// to reach the CTA rather than the whole device. Requesting Thread or Block
+// scope therefore costs less than a device-wide writeback.
+#define FLAGCX_DEVICE_BLOCK_FENCE __threadfence_block
 #define FLAGCX_DEVICE_SYNC_THREADS __syncthreads
 #define FLAGCX_THREAD_IDX_X threadIdx.x
 #define FLAGCX_BLOCK_IDX_X blockIdx.x
@@ -206,6 +210,7 @@
 #define FLAGCX_HOST_DEVICE_INLINE inline
 #define FLAGCX_DEVICE_CONSTANT_DECORATOR
 #define FLAGCX_DEVICE_THREAD_FENCE() ((void)0)
+#define FLAGCX_DEVICE_BLOCK_FENCE() ((void)0)
 #define FLAGCX_DEVICE_SYNC_THREADS() ((void)0)
 #define FLAGCX_THREAD_IDX_X 0
 #define FLAGCX_BLOCK_IDX_X 0
