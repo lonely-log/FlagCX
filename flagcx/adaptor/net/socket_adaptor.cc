@@ -805,9 +805,18 @@ static flagcxResult_t flagcxNetSocketMrImport(uint32_t key, void **baseOut,
   // A key can name one of our own registrations: one-sided all-to-all includes
   // a self entry, and cudaIpcOpenMemHandle refuses handles created by this very
   // process. Resolve it locally.
+  // g_sockMrs is mutated by regMr/deregMr under g_sockMrLock; traverse it under
+  // that lock too. Lock order here is peer -> registry, and no path takes the
+  // two in the opposite order.
+  pthread_mutex_lock(&g_sockMrLock);
   for (struct flagcxSockMr *own = g_sockMrs; own != NULL; own = own->next) {
     if (own->key != key)
       continue;
+    // Copy what we need while the registry lock still guarantees the entry is
+    // alive, then drop it before the allocation.
+    const uintptr_t ownAddr = own->addr;
+    const size_t ownSize = own->size;
+    pthread_mutex_unlock(&g_sockMrLock);
     struct flagcxSockPeerMr *self =
         (struct flagcxSockPeerMr *)calloc(1, sizeof(*self));
     if (self == NULL) {
@@ -815,10 +824,10 @@ static flagcxResult_t flagcxNetSocketMrImport(uint32_t key, void **baseOut,
       return flagcxSystemError;
     }
     self->key = key;
-    self->base = (void *)own->addr;
-    self->allocSize = own->size;
+    self->base = (void *)ownAddr;
+    self->allocSize = ownSize;
     self->userOffset = 0;
-    self->ownerVa = (uint64_t)own->addr;
+    self->ownerVa = (uint64_t)ownAddr;
     self->ownerPid = (int)getpid();
     self->next = g_sockPeerMrs;
     g_sockPeerMrs = self;
@@ -830,6 +839,8 @@ static flagcxResult_t flagcxNetSocketMrImport(uint32_t key, void **baseOut,
     pthread_mutex_unlock(&g_sockPeerMrLock);
     return flagcxSuccess;
   }
+
+  pthread_mutex_unlock(&g_sockMrLock);
 
   char path[64];
   flagcxNetSocketMrPath(key, path, sizeof(path));

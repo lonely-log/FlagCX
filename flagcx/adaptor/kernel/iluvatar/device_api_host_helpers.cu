@@ -55,19 +55,6 @@ static __thread cudaStream_t flagcxSockDevStream = nullptr;
 static __thread void *flagcxSockBounce = nullptr;
 static __thread size_t flagcxSockBounceSize = 0;
 
-// Wait for this thread's stream without forcing the device to drain other
-// streams. cudaStreamSynchronize is not safe here: it can wait for an
-// application kernel that is itself waiting for this transfer.
-static cudaError_t flagcxSockStreamPoll(cudaStream_t stream) {
-  for (;;) {
-    cudaError_t err = cudaStreamQuery(stream);
-    if (err == cudaSuccess)
-      return cudaSuccess;
-    if (err != cudaErrorNotReady)
-      return err;
-  }
-}
-
 static cudaError_t flagcxSockBounceBuffer(void **out, size_t size) {
   if (flagcxSockBounceSize >= size && flagcxSockBounce != nullptr) {
     *out = flagcxSockBounce;
