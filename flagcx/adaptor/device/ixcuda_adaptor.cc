@@ -530,6 +530,16 @@ struct flagcxDeviceAdaptor ixcudaAdaptor {
       FLAGCX_DEVICE_ADAPTOR_INTERNAL_NONE, NULL, NULL, NULL, NULL, NULL,
       // Preserve the legacy collective receive acquire until this platform
       // explicitly documents a coherent GPUDirect WRITE path.
+      //
+      // READ stays unset on purpose. Declaring it would make the GET path
+      // (flagcx_hetero.cc:750) demand FLAGCX_GDR_READ_REQUIRES_FLUSH from the
+      // net adaptor's gdrFlushCaps; no adaptor advertises that today, so iget
+      // would start failing instead of getting safer. Add READ only together
+      // with a real GET visibility stage and the matching net capability.
       FLAGCX_GDR_WRITE_REQUIRES_FLUSH,
+      // Declares the family so policy refuses CUDA-only coherence exemptions
+      // by recognising the device rather than by failing to recognise it.
+      FLAGCX_GDR_DEVICE_ILUVATAR,
+      NULL, // getDeviceArchitecture: ivcore11 arch is not a compute capability
 };
 #endif // USE_ILUVATAR_ADAPTOR

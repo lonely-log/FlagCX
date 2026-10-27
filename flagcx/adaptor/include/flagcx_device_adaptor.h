@@ -28,6 +28,11 @@ typedef enum {
   FLAGCX_GDR_DEVICE_METAX = 2,
   FLAGCX_GDR_DEVICE_DU = 3,
   FLAGCX_GDR_DEVICE_PPU = 4,
+  // Iluvatar ivcore11 cannot select llvm.nvvm.membar.sys, so it has no
+  // system-scope fence at all. The family is declared so policy can refuse
+  // every coherence exemption that assumes a device-scope fence already
+  // covers the edge, instead of silently treating the device as unknown.
+  FLAGCX_GDR_DEVICE_ILUVATAR = 5,
 } flagcxGdrDeviceFamily_t;
 
 // C-compatible typedef matching the C++ using alias in dlsymbols.h.

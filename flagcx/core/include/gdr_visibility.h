@@ -35,6 +35,11 @@ typedef enum {
   FLAGCX_GDR_VISIBILITY_REASON_ENV_FORCE = 1u << 6,
   FLAGCX_GDR_VISIBILITY_REASON_ENV_DISABLE = 1u << 7,
   FLAGCX_GDR_VISIBILITY_REASON_PEER_GPU_PUBLISH = 1u << 8,
+  // The device cannot express a system-scope fence. Recorded so conformance
+  // reporting can tell "policy refused an exemption because it recognised
+  // this family" apart from "policy did not recognise the device at all".
+  // This reason never relaxes requirements; it only annotates a decision.
+  FLAGCX_GDR_VISIBILITY_REASON_NO_SYSTEM_FENCE = 1u << 9,
 } flagcxGdrVisibilityReason_t;
 
 // All fields describe one concrete device/NIC connection. registrationRoute

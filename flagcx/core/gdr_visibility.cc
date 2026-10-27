@@ -20,7 +20,8 @@ FLAGCX_PARAM(GdrReadRequiresFlush, "GDR_READ_REQUIRES_FLUSH", -1);
 FLAGCX_PARAM(GdrWriteRequiresFlush, "GDR_WRITE_REQUIRES_FLUSH", -1);
 
 bool isKnownDeviceFamily(flagcxGdrDeviceFamily_t family) {
-  return family >= FLAGCX_GDR_DEVICE_UNKNOWN && family <= FLAGCX_GDR_DEVICE_PPU;
+  return family >= FLAGCX_GDR_DEVICE_UNKNOWN &&
+         family <= FLAGCX_GDR_DEVICE_ILUVATAR;
 }
 
 bool isKnownGpuNetPath(flagcxGdrGpuNetPath_t path) {
@@ -100,6 +101,17 @@ flagcxResult_t flagcxResolveGdrVisibilityPolicy(
         reasons |= FLAGCX_GDR_VISIBILITY_REASON_CUDA_DATADIRECT_C2C;
       }
     }
+  }
+
+  // Iluvatar has no system-scope fence: ivcore11 cannot select
+  // llvm.nvvm.membar.sys and __threadfence_system aborts llc. Every
+  // exemption above is written as "a device-scope fence is enough here";
+  // none of them can be proven for this family, so the device default stands
+  // unchanged and only a diagnostic reason is added. This block deliberately
+  // neither sets nor clears requirement bits -- clearing one would be exactly
+  // the silent downgrade this resolver exists to prevent.
+  if (context->deviceFamily == FLAGCX_GDR_DEVICE_ILUVATAR) {
+    reasons |= FLAGCX_GDR_VISIBILITY_REASON_NO_SYSTEM_FENCE;
   }
 
   if (context->providerForceRequirements != FLAGCX_GDR_FLUSH_NONE) {
